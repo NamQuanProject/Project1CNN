@@ -30,7 +30,9 @@ src/                      PyTorch pipeline (independent of cnn.ipynb)
   train.py                 Headless training entrypoint (CLI)
   evaluate.py               Re-evaluate a saved checkpoint on the test set
   compare.py                 Diff two runs' test_metrics.json into a comparison table
+  visualize_errors.py        Save an annotated PNG for every exact-match mismatch
 outputs/                  Generated per-run artifacts (git-ignored)
+visualizations/           Generated error-analysis images (git-ignored)
 ```
 
 `data/` and `src/` are kept at the repo root, separate from `cnn/` (which holds only
@@ -269,6 +271,23 @@ python src/evaluate.py --model-path outputs/baseline_<timestamp>/final_model.pt
 Writes `test_metrics.json` and a `sample_predictions.png` grid to
 `outputs/eval/` by default. If the checkpoint has EMA weights (`resnet50`), it uses
 those automatically; pass `--no-ema` to evaluate the raw weights instead.
+
+### Visualizing exact-match errors
+
+```bash
+python src/visualize_errors.py --model-path outputs/resnet_v2/final_model.pt
+```
+
+Runs the checkpoint over the full test set and, for every image whose prediction
+isn't an *exact* match, saves one annotated PNG (`error_<index>.png`) to
+`visualizations/<run-name>/` — `<run-name>` is inferred from the checkpoint's parent
+folder (override with `--output-dir`). Each image's title shows the true digits, the
+predicted digits, and precisely which digits were **missing** (present but not
+predicted — false negatives) or **extra** (predicted but not present — false
+positives), so you can see at a glance not just *that* a prediction was wrong but
+*how*. A `summary.json` (total images, mismatch count/rate) is written alongside
+them. Use `--max-images N` to cap how many get saved on a model with a lot of
+mismatches; `--no-ema` and `--amp`/`--device` behave the same as `evaluate.py`.
 
 ### Comparing baseline vs. improved
 
