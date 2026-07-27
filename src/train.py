@@ -117,6 +117,87 @@ def smooth_labels(labels, label_smoothing):
     return labels * (1 - label_smoothing) + 0.5 * label_smoothing
 
 
+def asymmetric_loss_with_logits(logits, targets, gamma_neg=4.0, gamma_pos=1.0, clip=0.05, eps=1e-8):
+    """Asymmetric Loss (ASL) for multi-label classification (Ben-Baruch,
+    Ridnik, et al., ICCV 2021, "Asymmetric Loss For Multi-Label
+    Classification") -- widely regarded as one of the strongest losses for
+    multi-label tasks. Unlike plain BCE or symmetric focal loss, it treats
+    positives and negatives asymmetrically: each image here has only ~6-8 of
+    10 possible digits present, so negatives outnumber positives per sample,
+    and the easy majority of negatives can otherwise dominate/flatten the
+    gradient. ASL addresses this with two mechanisms:
+    - **Asymmetric focusing**: a stronger focusing exponent on negatives
+      (`gamma_neg`, default 4) than positives (`gamma_pos`, default 1),
+      down-weighting easy negatives more aggressively than focal loss does
+      symmetrically.
+    - **Probability shifting/clipping** (`clip`, default 0.05): negatives
+      predicted confidently correct beyond this margin are shifted to
+      contribute ~zero loss, entirely discarding the easiest negatives so
+      gradient concentrates on the hard, ambiguous ones (e.g. a distractor
+      digit that's partially occluded by an overlapping digit).
+
+    Reference implementation: github.com/Alibaba-MIIL/ASL. The focusing
+    weight is computed under `torch.no_grad()` (i.e. treated as a constant
+    multiplier, not differentiated through) matching the reference's default
+    `disable_torch_grad_focal_loss=True` -- this is the standard, stable way
+    to use ASL and is what the paper's reported results use.
+    """
+    xs_pos = torch.sigmoid(logits)
+    xs_neg = 1 - xs_pos
+
+    if clip is not None and clip > 0:
+        xs_neg = (xs_neg + clip).clamp(max=1)
+
+    los_pos = targets * torch.log(xs_pos.clamp(min=eps))
+    los_neg = (1 - targets) * torch.log(xs_neg.clamp(min=eps))
+    loss = los_pos + los_neg
+
+    if gamma_neg > 0 or gamma_pos > 0:
+        with torch.no_grad():
+            pt = xs_pos * targets + xs_neg * (1 - targets)
+            one_sided_gamma = gamma_pos * targets + gamma_neg * (1 - targets)
+            one_sided_w = torch.pow((1 - pt).clamp(min=0), one_sided_gamma)
+        loss = loss * one_sided_w
+
+    return -loss.mean()
+
+
+def build_criterion(loss_type, focal_gamma=0.0, asl_gamma_neg=4.0, asl_gamma_pos=1.0, asl_clip=0.05, asl_weight=1.0):
+    """Build the training/eval loss function selected by --loss-type.
+
+    "asl" supports being a *combined* (weighted) loss: `asl_weight` (0-1)
+    blends ASL with plain BCE -- `asl_weight * ASL + (1 - asl_weight) * BCE`
+    -- defaulting to 1.0 (pure ASL, the standard way the paper uses it), but
+    lower values let you experiment with an explicit ASL+BCE combination.
+    """
+    if loss_type == "asl":
+        def combined_asl(logits, targets):
+            asl = asymmetric_loss_with_logits(
+                logits, targets, gamma_neg=asl_gamma_neg, gamma_pos=asl_gamma_pos, clip=asl_clip
+            )
+            if asl_weight >= 1.0:
+                return asl
+            bce = nn.functional.binary_cross_entropy_with_logits(logits, targets)
+            return asl_weight * asl + (1 - asl_weight) * bce
+
+        return combined_asl
+    if loss_type == "focal" and focal_gamma and focal_gamma > 0:
+        return functools.partial(focal_loss_with_logits, gamma=focal_gamma)
+    return nn.BCEWithLogitsLoss()
+
+
+def focal_loss_with_logits(logits, targets, gamma):
+    """Focal loss (Lin et al., 2017), binary/multi-label form: down-weights
+    already-confident (easy) predictions and up-weights uncertain (hard)
+    ones relative to plain BCE.
+    """
+    bce = nn.functional.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+    p = torch.sigmoid(logits)
+    p_t = p * targets + (1 - p) * (1 - targets)
+    focal_weight = (1 - p_t).clamp(min=0.0) ** gamma
+    return (focal_weight * bce).mean()
+
+
 def resolve_amp_dtype(device, amp_mode):
     """Resolve --amp {auto,on,off} to an autocast dtype, or None to disable.
 
@@ -252,6 +333,46 @@ def parse_args():
         type=float,
         default=None,
         help="Softens 0/1 BCE targets toward 0.5 by this amount (training loss only). Defaults per-model.",
+    )
+    parser.add_argument(
+        "--loss-type",
+        choices=["bce", "focal", "asl"],
+        default=None,
+        help="Training/eval loss function. Defaults to the model's recommendation, or 'bce' otherwise.",
+    )
+    parser.add_argument(
+        "--focal-gamma",
+        type=float,
+        default=None,
+        help="Focusing exponent, only used when --loss-type focal. Defaults per-model. Try 2.0.",
+    )
+    parser.add_argument(
+        "--asl-gamma-neg",
+        type=float,
+        default=None,
+        help="Asymmetric Loss negative-class focusing exponent, only used when --loss-type asl. "
+        "Defaults per-model, else 4.0 (the paper's recommendation).",
+    )
+    parser.add_argument(
+        "--asl-gamma-pos",
+        type=float,
+        default=None,
+        help="Asymmetric Loss positive-class focusing exponent, only used when --loss-type asl. "
+        "Defaults per-model, else 1.0 (the paper's recommendation).",
+    )
+    parser.add_argument(
+        "--asl-clip",
+        type=float,
+        default=None,
+        help="Asymmetric Loss probability-shifting margin for easy negatives, only used when "
+        "--loss-type asl. Defaults per-model, else 0.05 (the paper's recommendation).",
+    )
+    parser.add_argument(
+        "--asl-weight",
+        type=float,
+        default=None,
+        help="Blends ASL with plain BCE: asl_weight*ASL + (1-asl_weight)*BCE, only used when "
+        "--loss-type asl. Defaults per-model, else 1.0 (pure ASL).",
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
@@ -437,6 +558,12 @@ def main():
         None, args.model, "monitor_mode", MONITOR_MODE_BY_METRIC.get(monitor_metric, "max")
     )
     label_smoothing = resolve_hparam(args.label_smoothing, args.model, "label_smoothing", 0.0)
+    loss_type = resolve_hparam(args.loss_type, args.model, "loss_type", "bce")
+    focal_gamma = resolve_hparam(args.focal_gamma, args.model, "focal_gamma", 2.0)
+    asl_gamma_neg = resolve_hparam(args.asl_gamma_neg, args.model, "asl_gamma_neg", 4.0)
+    asl_gamma_pos = resolve_hparam(args.asl_gamma_pos, args.model, "asl_gamma_pos", 1.0)
+    asl_clip = resolve_hparam(args.asl_clip, args.model, "asl_clip", 0.05)
+    asl_weight = resolve_hparam(args.asl_weight, args.model, "asl_weight", 1.0)
     pretrained = resolve_hparam(args.pretrained, args.model, "pretrained", False)
     ema_enabled = resolve_hparam(args.ema, args.model, "ema", False)
     ema_decay = resolve_hparam(args.ema_decay, args.model, "ema_decay", 0.999)
@@ -446,7 +573,16 @@ def main():
         f"weight_decay={weight_decay}, batch_size={batch_size}, scheduler={scheduler_type}, "
         f"warmup_epochs={warmup_epochs}, grad_clip_norm={grad_clip_norm}, patience={patience}, "
         f"lr_patience={lr_patience}, min_lr={min_lr}, monitor={monitor_metric} ({monitor_mode}), "
-        f"label_smoothing={label_smoothing}, pretrained={pretrained}, ema={ema_enabled} (decay={ema_decay})"
+        f"label_smoothing={label_smoothing}, loss_type={loss_type}"
+        + (
+            f" (asl_gamma_neg={asl_gamma_neg}, asl_gamma_pos={asl_gamma_pos}, asl_clip={asl_clip}, "
+            f"asl_weight={asl_weight})"
+            if loss_type == "asl"
+            else f" (focal_gamma={focal_gamma})"
+            if loss_type == "focal"
+            else ""
+        )
+        + f", pretrained={pretrained}, ema={ema_enabled} (decay={ema_decay})"
     )
 
     amp_dtype = resolve_amp_dtype(device, args.amp)
@@ -521,7 +657,14 @@ def main():
 
     ema = ModelEMA(raw_model, decay=ema_decay) if ema_enabled else None
 
-    criterion = nn.BCEWithLogitsLoss()
+    criterion = build_criterion(
+        loss_type,
+        focal_gamma=focal_gamma,
+        asl_gamma_neg=asl_gamma_neg,
+        asl_gamma_pos=asl_gamma_pos,
+        asl_clip=asl_clip,
+        asl_weight=asl_weight,
+    )
     optimizer_cls = torch.optim.AdamW if optimizer_name == "adamw" else torch.optim.Adam
     param_groups = build_param_groups(
         raw_model,
@@ -709,6 +852,12 @@ def main():
             "monitor_metric": monitor_metric,
             "monitor_mode": monitor_mode,
             "label_smoothing": label_smoothing,
+            "loss_type": loss_type,
+            "focal_gamma": focal_gamma,
+            "asl_gamma_neg": asl_gamma_neg,
+            "asl_gamma_pos": asl_gamma_pos,
+            "asl_clip": asl_clip,
+            "asl_weight": asl_weight,
             "pretrained": pretrained,
             "ema": ema_enabled,
             "ema_decay": ema_decay,

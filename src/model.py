@@ -466,6 +466,16 @@ MODEL_HPARAM_DEFAULTS = {
         "ema": True,
         "ema_decay": 0.9995,
         "label_smoothing": 0.05,
+        # Asymmetric Loss (Ben-Baruch/Ridnik et al., ICCV 2021) instead of
+        # plain BCE: handles the positive/negative imbalance in this task
+        # (~6-8 of 10 digit slots present per image, so negatives outnumber
+        # positives) via asymmetric focusing + probability-shifting for easy
+        # negatives. See train.py:asymmetric_loss_with_logits. Paper-recommended
+        # defaults (asl_gamma_neg=4, asl_gamma_pos=1, asl_clip=0.05) apply via
+        # train.py's fallbacks; asl_weight=1.0 here means pure ASL, not
+        # blended with BCE -- lower it (e.g. --asl-weight 0.5) to experiment
+        # with an explicit ASL+BCE combination.
+        "loss_type": "asl",
     },
     "unet": {
         "lr": 3e-4,

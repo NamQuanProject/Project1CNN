@@ -58,8 +58,9 @@ directory.
   translation+zoom+contrast (no rotation/flip) for `resnet`.
 - `--lr`, `--backbone-lr`, `--optimizer`, `--weight-decay`, `--batch-size`,
   `--scheduler`, `--warmup-epochs`, `--grad-clip-norm`, `--patience`, `--lr-patience`,
-  `--min-lr`, `--monitor-metric`, `--monitor-mode`, `--label-smoothing`, `--ema`,
-  `--ema-decay` all default to `None`/`auto`, which resolves to each model's
+  `--min-lr`, `--monitor-metric`, `--monitor-mode`, `--label-smoothing`, `--loss-type`,
+  `--focal-gamma`, `--asl-gamma-neg`, `--asl-gamma-pos`, `--asl-clip`, `--asl-weight`,
+  `--ema`, `--ema-decay` all default to `None`/`auto`, which resolves to each model's
   recommended setting (`MODEL_HPARAM_DEFAULTS` in `src/model.py`) — pass any of them
   explicitly to override.
 
@@ -91,9 +92,23 @@ Layered on top of that reference recipe:
   training samples, with drop probability increasing with depth (0 → 0.1 across the
   5 blocks), regularizing the extra capacity from the added blocks/SE gates.
 - **EMA of weights** (on by default, decay `0.9995`) and **label smoothing** (`0.05`,
-  applied to the training BCE loss only — never to metrics or val/test loss; softens
-  hard 0/1 targets toward 0.5, useful since overlapping/occluded digits make some
-  labels genuinely ambiguous).
+  applied to the training loss only — never to metrics or val/test loss; softens hard
+  0/1 targets toward 0.5, useful since overlapping/occluded digits make some labels
+  genuinely ambiguous).
+- **Asymmetric Loss (ASL)** instead of plain BCE (`--loss-type`, default `asl` for this
+  model; see `train.py:asymmetric_loss_with_logits`) — widely regarded as one of the
+  strongest losses for multi-label classification (Ben-Baruch/Ridnik et al., ICCV
+  2021). Each image here has only ~6-8 of 10 possible digits present, so negatives
+  outnumber positives per sample; plain BCE lets the easy majority of negatives
+  flatten the gradient. ASL counters this with (1) a stronger focusing exponent on
+  negatives than positives (`--asl-gamma-neg 4`, `--asl-gamma-pos 1`, asymmetric
+  unlike symmetric focal loss) and (2) probability-shifting (`--asl-clip 0.05`) that
+  discards already-easy, confidently-correct negatives from the loss entirely,
+  concentrating gradient on the genuinely hard/ambiguous ones. It's also a *combined*
+  (weighted) loss: `--asl-weight` (default `1.0`, pure ASL) blends it with plain BCE —
+  `asl_weight*ASL + (1-asl_weight)*BCE` — for anyone who wants to dial back toward
+  BCE rather than switch fully. `--loss-type focal` (symmetric focal loss) is also
+  available as a simpler alternative.
 - **Early-stopping and best-checkpoint selection watch `exact_match_accuracy`
   directly** (`--monitor-metric`, mode `max`) instead of `val_loss` — the metric that
   actually matters for this task, which can keep improving even while `val_loss` is
