@@ -22,9 +22,9 @@ from torch.utils.data import DataLoader
 
 from src.data import load_splits, multihot_to_digits
 from src.metrics import PREDICTION_THRESHOLD, per_position_accuracy
-from src.model import MODEL_BUILDERS
+from src.model import build_model
 from src.train import evaluate as run_evaluate
-from src.train import get_device
+from src.train import get_device, resolve_amp_dtype
 
 DEFAULT_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data")
 DEFAULT_OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "outputs", "eval")
@@ -37,6 +37,14 @@ def parse_args():
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda", "mps"])
+    parser.add_argument("--amp", choices=["auto", "on", "off"], default="auto")
+    parser.add_argument(
+        "--no-ema",
+        dest="use_ema",
+        action="store_false",
+        default=True,
+        help="If the checkpoint has EMA weights, use the raw (non-EMA) weights instead.",
+    )
     parser.add_argument("--num-samples-viz", type=int, default=12)
     return parser.parse_args()
 
@@ -45,17 +53,30 @@ def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
     device = get_device(args.device)
+    amp_dtype = resolve_amp_dtype(device, args.amp)
+    channels_last = device.type == "cuda"
 
     checkpoint = torch.load(args.model_path, map_location=device)
-    model = MODEL_BUILDERS[checkpoint["model_name"]]().to(device)
-    model.load_state_dict(checkpoint["state_dict"])
+    # Always pretrained=False: we're about to overwrite the weights with the
+    # checkpoint's trained state_dict, so downloading ImageNet weights first
+    # would be wasted work (and fail on offline eval machines).
+    model = build_model(checkpoint["model_name"], pretrained=False).to(device)
+
+    ema_state = checkpoint.get("ema_state_dict")
+    if args.use_ema and ema_state is not None:
+        print("Using EMA weights from checkpoint.")
+        model.load_state_dict(ema_state)
+    else:
+        model.load_state_dict(checkpoint["state_dict"])
+    if channels_last:
+        model = model.to(memory_format=torch.channels_last)
 
     splits = load_splits(args.data_dir)
     test_ds = splits["test"]
     test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False)
 
     criterion = nn.BCEWithLogitsLoss()
-    test_metrics, y_true, y_pred = run_evaluate(model, test_loader, criterion, device)
+    test_metrics, y_true, y_pred = run_evaluate(model, test_loader, criterion, device, amp_dtype, channels_last)
     pos_acc = per_position_accuracy(y_true, y_pred, threshold=PREDICTION_THRESHOLD)
 
     print("Test metrics:")

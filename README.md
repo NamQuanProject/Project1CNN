@@ -26,7 +26,7 @@ data/
 src/                      PyTorch pipeline (independent of cnn.ipynb)
   data.py                MultiLabelDigitsDataset, load_splits
   metrics.py              exact_match_accuracy, per_position_accuracy, binary_accuracy, precision_recall
-  model.py                 BaselineCNN, ImprovedCNN, ResNetCNN (nn.Module)
+  model.py                 BaselineCNN, ImprovedCNN, ResNetCNN, ResNet50CNN (nn.Module)
   train.py                 Headless training entrypoint (CLI)
   evaluate.py               Re-evaluate a saved checkpoint on the test set
   compare.py                 Diff two runs' test_metrics.json into a comparison table
@@ -56,9 +56,11 @@ directory.
 - `--augment` applies light augmentation (`torchvision.transforms`) to the training
   split only: rotation+translation+scale for `baseline`/`improved`, or
   translation+zoom+contrast (no rotation/flip) for `resnet`.
-- `--lr`, `--optimizer`, `--weight-decay` default to `None`, which resolves to each
-  model's recommended setting (`MODEL_HPARAM_DEFAULTS` in `src/model.py`) — pass any
-  of them explicitly to override.
+- `--lr`, `--backbone-lr`, `--optimizer`, `--weight-decay`, `--batch-size`,
+  `--scheduler`, `--warmup-epochs`, `--grad-clip-norm`, `--patience`, `--ema`,
+  `--ema-decay` all default to `None`/`auto`, which resolves to each model's
+  recommended setting (`MODEL_HPARAM_DEFAULTS` in `src/model.py`) — pass any of them
+  explicitly to override.
 
 ### Improvement 2: `resnet`
 
@@ -75,6 +77,74 @@ and corrupt the label.
 ```bash
 python src/train.py --model resnet --augment --run-name resnet_v1
 ```
+
+### Improvement 3: `resnet50` (real ResNet-50 + optimized GPU training recipe)
+
+`ResNet50CNN` (`src/model.py`) wraps `torchvision.models.resnet50` instead of a
+hand-rolled residual net, adapted for 64×64 grayscale input:
+
+- **Small-image stem**: `conv1` is 3×3 stride-1 (not the ImageNet 7×7 stride-2) and
+  the initial maxpool is removed. The stock ImageNet stem downsamples 4× before the
+  residual stages even start; on a 64×64 canvas that collapses to a 2×2 feature map
+  and destroys the fine detail needed to separate overlapping digits. This keeps an
+  8×8×2048 map into the final stage instead — the standard adaptation used for
+  CIFAR-/small-image ResNets.
+- **`fc`** is replaced with `Linear(2048, 10)`, returning logits (paired with
+  `BCEWithLogitsLoss`, like every other model here).
+- **ImageNet-pretrained weights** (`--pretrained`, on by default) load into
+  `layer1`–`layer4`; the stem and `fc` are always freshly initialized since their
+  shapes changed. If the pretrained-weights download fails (e.g. no internet on a
+  compute node), it prints a warning and falls back to random init rather than
+  crashing — pass `--no-pretrained` to skip the download entirely.
+
+```bash
+python src/train.py --model resnet50 --augment --run-name resnet50_v1
+```
+
+**The training recipe** (`src/train.py`) applies several widely-used techniques for
+training CNNs efficiently and to higher accuracy, auto-enabled on CUDA and
+specifically tuned as the `resnet50` defaults in `MODEL_HPARAM_DEFAULTS`:
+
+- **Differential learning rates**: the pretrained backbone (`layer1`-`4`) trains at
+  `--backbone-lr` (default `1e-4`), 10× lower than the freshly-initialized stem/fc
+  (`--lr`, default `1e-3`) — large early updates from a random head would otherwise
+  blow away the useful pretrained features.
+- **No weight decay on norm/bias params**: `build_param_groups()` in `src/model.py`
+  splits parameters so BatchNorm scale/shift and all biases skip weight decay
+  (`--weight-decay`, default `0.05` on the remaining conv/linear weights) — decaying
+  those hurts normalization behavior for no regularization benefit.
+- **Cosine LR schedule with linear warmup** (`--scheduler cosine_warmup`, the
+  `resnet50` default; `--warmup-epochs`, default `5`) instead of `ReduceLROnPlateau`
+  — a fixed, well-behaved schedule for a training run of a known length. Because it
+  assumes running to completion, early stopping is effectively disabled for this
+  model (`patience` defaults very high) rather than cutting the schedule short.
+- **Mixed precision** (`--amp`, default `auto` = on whenever CUDA is available):
+  prefers `bfloat16` autocast (no `GradScaler`/loss-scaling needed, no underflow
+  risk) when the GPU supports it — e.g. Ampere and newer, including A100 — else
+  falls back to `float16` with a `GradScaler`.
+- **`torch.compile`** (`--compile`, default `auto` = on whenever CUDA is available),
+  wrapped in a try/except so a compilation failure (e.g. missing Triton on some
+  clusters) just prints a warning and continues eagerly instead of crashing.
+- **Channels-last memory format**, applied to the model and every input batch on
+  CUDA — standard Tensor Core layout optimization for conv-heavy nets.
+- **Gradient clipping** (`--grad-clip-norm`, default `1.0`) for stability at the
+  larger effective batch size / learning rate.
+- **EMA of model weights** (`--ema`, on by default for `resnet50`; `--ema-decay`,
+  default `0.9998`): validation and the final saved model use the exponential
+  moving average of weights rather than the raw last-step weights, which typically
+  generalizes a bit better. Checkpoints store both (`state_dict` and
+  `ema_state_dict`); `evaluate.py` prefers the EMA weights automatically when
+  present (`--no-ema` to use the raw weights instead).
+- **Larger batch size** (`--batch-size`, default `256` for `resnet50` vs. `128` for
+  the other models) and **auto-scaled `DataLoader` workers**
+  (`min(8, os.cpu_count())` with `pin_memory`/`persistent_workers` on CUDA) to keep
+  the GPU fed.
+- `cudnn.benchmark = True` and `torch.set_float32_matmul_precision("high")` (TF32
+  matmuls) are enabled globally whenever training on CUDA.
+
+All of the above are plain CLI flags — every default can be overridden, e.g.
+`python src/train.py --model resnet50 --no-pretrained --amp off --compile off` to
+train from scratch in full precision without `torch.compile`.
 
 ## Setup
 
@@ -106,12 +176,15 @@ Each run writes to `outputs/<run-name>/`:
 - `model_summary.txt` — layer-by-layer architecture and parameter count
 - `training_curves.png` — loss / binary-accuracy curves
 - `history.json` — full per-epoch training history
-- `best_model.pt`, `final_model.pt` — saved checkpoints (`{"model_name", "state_dict"}`)
+- `best_model.pt`, `final_model.pt` — saved checkpoints
+  (`{"model_name", "state_dict", "ema_state_dict", "pretrained"}`)
 - `test_metrics.json` — test-set loss, binary_accuracy, precision, recall,
   exact_match_accuracy, and per-digit (per-position) accuracy
 
-Useful flags: `--epochs`, `--batch-size`, `--lr`, `--patience`, `--seed`, `--device`,
-`--data-dir`, `--output-dir`. Run `python src/train.py --help` for the full list.
+Useful flags: `--epochs`, `--batch-size`, `--lr`, `--patience`, `--seed`, `--device`.
+See [Improvement 3](#improvement-3-resnet50-real-resnet-50--optimized-gpu-training-recipe)
+above for the additional `resnet50`-specific flags (`--backbone-lr`, `--scheduler`,
+`--amp`, `--compile`, `--ema`, etc). Run `python src/train.py --help` for the full list.
 
 ### Re-evaluating a saved checkpoint
 
@@ -120,7 +193,8 @@ python src/evaluate.py --model-path outputs/baseline_<timestamp>/final_model.pt
 ```
 
 Writes `test_metrics.json` and a `sample_predictions.png` grid to
-`outputs/eval/` by default.
+`outputs/eval/` by default. If the checkpoint has EMA weights (`resnet50`), it uses
+those automatically; pass `--no-ema` to evaluate the raw weights instead.
 
 ### Comparing baseline vs. improved
 
