@@ -26,7 +26,7 @@ data/
 src/                      PyTorch pipeline (independent of cnn.ipynb)
   data.py                MultiLabelDigitsDataset, load_splits
   metrics.py              exact_match_accuracy, per_position_accuracy, binary_accuracy, precision_recall
-  model.py                 BaselineCNN, ImprovedCNN, ResNetCNN, ResNet50CNN (nn.Module)
+  model.py                 BaselineCNN, ImprovedCNN, ResNetCNN, ResNet50CNN, UNetCNN (nn.Module)
   train.py                 Headless training entrypoint (CLI)
   evaluate.py               Re-evaluate a saved checkpoint on the test set
   compare.py                 Diff two runs' test_metrics.json into a comparison table
@@ -145,6 +145,36 @@ specifically tuned as the `resnet50` defaults in `MODEL_HPARAM_DEFAULTS`:
 All of the above are plain CLI flags — every default can be overridden, e.g.
 `python src/train.py --model resnet50 --no-pretrained --amp off --compile off` to
 train from scratch in full precision without `torch.compile`.
+
+> **Note:** in practice, `resnet50`'s 23.5M parameters badly overfit this 50k-image
+> dataset despite the regularization above. `resnet` (309K params) and `unet` (below,
+> ~483K params) are the better-fitted options for a dataset this size — reach for
+> `resnet50` only if you have a strong reason to believe more capacity will help
+> (e.g. after confirming the smaller models have plateaued and aren't overfitting).
+
+### Improvement 4: `unet`
+
+`UNetCNN` (`src/model.py`) is a small, standard U-Net encoder-decoder —
+`DoubleConv` (Conv→BN→ReLU ×2) blocks, 3 downsampling stages (channels
+`base`→`base*2`→`base*4`, `base=16` by default) into a `base*8` bottleneck at 8×8,
+then 3 upsampling stages (`ConvTranspose2d` + concat matching encoder skip +
+`DoubleConv`) back to full 64×64 resolution — repurposed for classification instead
+of its usual per-pixel segmentation:
+
+- **Head**: `GlobalAveragePooling → Dropout(0.3) → Linear(10)` on the final
+  64×64×`base` decoder output, instead of U-Net's usual 1×1-conv-per-pixel
+  segmentation head.
+- **Motivation**: the skip connections keep full-resolution detail available late in
+  the network (unlike a plain encoder, which only ever sees a heavily downsampled
+  8×8 view by the time it reaches the classifier) — this can help separate small,
+  overlapping digits that a plain encoder would blur away.
+- **Size**: ~483K params — deliberately close to `resnet`'s budget (309K), not
+  `resnet50`'s (23.5M), given what happened above. Same `AdamW(lr=3e-4,
+  weight_decay=1e-4)` recipe and rotation/flip-free augmentation as `resnet`.
+
+```bash
+python src/train.py --model unet --augment --run-name unet_v1
+```
 
 ## Setup
 

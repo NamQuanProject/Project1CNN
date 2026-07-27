@@ -65,11 +65,11 @@ def get_device(preference="auto"):
 
 
 def build_augmentation(model_name):
-    """Light training-time augmentation. No rotation/flip for "resnet" or
-    "resnet50": that can turn a 6 into a 9 (or vice versa) and corrupt the
-    label.
+    """Light training-time augmentation. No rotation/flip for "resnet",
+    "resnet50", or "unet": that can turn a 6 into a 9 (or vice versa) and
+    corrupt the label.
     """
-    if model_name in ("resnet", "resnet50"):
+    if model_name in ("resnet", "resnet50", "unet"):
         return transforms.Compose(
             [
                 # Keras RandomTranslation(0.04, 0.04) / RandomZoom(-0.08, 0.08).
@@ -244,7 +244,7 @@ def parse_args():
         "--augment",
         action="store_true",
         help="Apply light augmentation to training data (rotation+translate+scale, "
-        "or for --model resnet/resnet50: translate+zoom+contrast only, no rotation/flip).",
+        "or for --model resnet/resnet50/unet: translate+zoom+contrast only, no rotation/flip).",
     )
     parser.add_argument(
         "--run-name",
@@ -415,6 +415,11 @@ def main():
         num_workers=num_workers,
         pin_memory=pin_memory,
         persistent_workers=num_workers > 0,
+        # Drop the ragged last batch so every training step has the same
+        # shape -- with torch.compile / cudnn.benchmark enabled, a
+        # differently-sized last batch forces an extra recompile/autotune
+        # pass every single epoch. val/test keep every sample (no drop).
+        drop_last=len(train_ds) > batch_size,
     )
     val_loader = DataLoader(
         val_ds,
@@ -464,7 +469,7 @@ def main():
     )
     optimizer = optimizer_cls(param_groups, lr=lr)
 
-    scaler = torch.cuda.amp.GradScaler(enabled=(amp_dtype == torch.float16)) if device.type == "cuda" else None
+    scaler = torch.amp.GradScaler("cuda", enabled=(amp_dtype == torch.float16)) if device.type == "cuda" else None
 
     plateau_scheduler = None
     step_scheduler = None

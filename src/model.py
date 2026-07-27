@@ -212,11 +212,93 @@ class ResNet50CNN(nn.Module):
         return head, backbone
 
 
+class DoubleConv(nn.Module):
+    """(Conv -> BN -> ReLU) x2, the standard U-Net conv block. Same-padding
+    (padding=1) throughout, so spatial size only changes via pool/upsample --
+    no cropping needed for skip connections, unlike the original U-Net paper.
+    """
+
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x):
+        return self.block(x)
+
+
+class UNetCNN(nn.Module):
+    """Improvement 4: a small U-Net, repurposed for multi-label
+    classification instead of its usual per-pixel segmentation use.
+
+    - Encoder: 3x (DoubleConv + maxpool), channels base -> base*2 -> base*4,
+      then a DoubleConv bottleneck at base*8 (64x64 -> 8x8, same total
+      reduction as the other models here).
+    - Decoder: 3x (ConvTranspose2d upsample -> concat matching encoder skip
+      -> DoubleConv), mirroring the encoder back up to full 64x64 resolution
+      at `base` channels.
+    - Classification head: GlobalAveragePooling -> Dropout -> Linear(10),
+      instead of U-Net's usual 1x1-conv-per-pixel segmentation head. The
+      motivation for trying U-Net here is that its skip connections keep
+      full-resolution detail available late in the network, which can help
+      separate small overlapping digits that a plain encoder would blur
+      away by the time it reaches the bottleneck.
+    - Kept deliberately small (base=16, ~480K total params): ResNet-50's
+      23.5M params badly overfit this 50k-image dataset, so this stays much
+      closer to the custom `resnet` model's parameter budget (309K) rather
+      than repeating that mistake.
+    """
+
+    def __init__(self, in_channels=1, num_classes=10, base=16, dropout=0.3):
+        super().__init__()
+        self.enc1 = DoubleConv(in_channels, base)
+        self.enc2 = DoubleConv(base, base * 2)
+        self.enc3 = DoubleConv(base * 2, base * 4)
+        self.bottleneck = DoubleConv(base * 4, base * 8)
+        self.pool = nn.MaxPool2d(2)
+
+        self.up3 = nn.ConvTranspose2d(base * 8, base * 4, kernel_size=2, stride=2)
+        self.dec3 = DoubleConv(base * 8, base * 4)
+        self.up2 = nn.ConvTranspose2d(base * 4, base * 2, kernel_size=2, stride=2)
+        self.dec2 = DoubleConv(base * 4, base * 2)
+        self.up1 = nn.ConvTranspose2d(base * 2, base, kernel_size=2, stride=2)
+        self.dec1 = DoubleConv(base * 2, base)
+
+        self.pool_out = nn.AdaptiveAvgPool2d(1)
+        self.dropout = nn.Dropout(dropout)
+        self.fc = nn.Linear(base, num_classes)
+
+    def forward(self, x):
+        e1 = self.enc1(x)  # base,   64x64
+        e2 = self.enc2(self.pool(e1))  # base*2, 32x32
+        e3 = self.enc3(self.pool(e2))  # base*4, 16x16
+        b = self.bottleneck(self.pool(e3))  # base*8, 8x8
+
+        d3 = self.up3(b)  # base*4, 16x16
+        d3 = self.dec3(torch.cat([d3, e3], dim=1))
+        d2 = self.up2(d3)  # base*2, 32x32
+        d2 = self.dec2(torch.cat([d2, e2], dim=1))
+        d1 = self.up1(d2)  # base,   64x64
+        d1 = self.dec1(torch.cat([d1, e1], dim=1))
+
+        out = self.pool_out(d1)
+        out = torch.flatten(out, 1)
+        out = self.dropout(out)
+        return self.fc(out)
+
+
 MODEL_BUILDERS = {
     "baseline": BaselineCNN,
     "improved": ImprovedCNN,
     "resnet": ResNetCNN,
     "resnet50": ResNet50CNN,
+    "unet": UNetCNN,
 }
 
 
@@ -273,6 +355,11 @@ def build_param_groups(model, lr, weight_decay, backbone_lr=None):
 # recommendation"). Explicit CLI flags always win.
 MODEL_HPARAM_DEFAULTS = {
     "resnet": {
+        "lr": 3e-4,
+        "optimizer": "adamw",
+        "weight_decay": 1e-4,
+    },
+    "unet": {
         "lr": 3e-4,
         "optimizer": "adamw",
         "weight_decay": 1e-4,
