@@ -1,8 +1,8 @@
-"""Train the multi-label digit CNN (baseline or improved) headlessly.
+"""Train the multi-label digit CNN (baseline or improved) using PyTorch.
 
-Usage (from repo root or from cnn/, either works):
-    python cnn/src/train.py --model baseline
-    python cnn/src/train.py --model improved --augment --epochs 100
+Usage (from repo root or from src/, either works):
+    python src/train.py --model baseline
+    python src/train.py --model improved --augment --epochs 100
 """
 
 import argparse
@@ -19,11 +19,20 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
-import tensorflow as tf
 import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from torchvision import transforms
+from tqdm import tqdm
 
 from src.data import load_splits
-from src.metrics import PREDICTION_THRESHOLD, exact_match_accuracy, per_position_accuracy
+from src.metrics import (
+    PREDICTION_THRESHOLD,
+    binary_accuracy,
+    exact_match_accuracy,
+    per_position_accuracy,
+    precision_recall,
+)
 from src.model import MODEL_BUILDERS
 
 DEFAULT_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data")
@@ -34,33 +43,30 @@ def fix_random_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    tf.random.set_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def get_device(preference="auto"):
+    if preference != "auto":
+        return torch.device(preference)
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
 
 
 def build_augmentation():
-    return tf.keras.Sequential(
+    return transforms.Compose(
         [
-            tf.keras.layers.RandomRotation(0.05),
-            tf.keras.layers.RandomTranslation(0.05, 0.05),
-            tf.keras.layers.RandomZoom(0.05),
-        ],
-        name="augmentation",
+            transforms.RandomRotation(degrees=10),
+            transforms.RandomAffine(degrees=0, translate=(0.05, 0.05), scale=(0.95, 1.05)),
+        ]
     )
-
-
-def make_train_dataset(images, labels, batch_size, augment_layer, seed):
-    ds = tf.data.Dataset.from_tensor_slices((images, labels))
-    ds = ds.shuffle(buffer_size=len(images), seed=seed, reshuffle_each_iteration=True)
-    ds = ds.batch(batch_size)
-    ds = ds.map(
-        lambda x, y: (augment_layer(x, training=True), y),
-        num_parallel_calls=tf.data.AUTOTUNE,
-    )
-    return ds.prefetch(tf.data.AUTOTUNE)
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train the multi-label digit CNN.")
+    parser = argparse.ArgumentParser(description="Train the multi-label digit CNN (PyTorch).")
     parser.add_argument("--data-dir", default=DEFAULT_DATA_DIR)
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--model", choices=sorted(MODEL_BUILDERS), default="baseline")
@@ -69,10 +75,12 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--patience", type=int, default=5)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda", "mps"])
     parser.add_argument(
         "--augment",
         action="store_true",
-        help="Apply light rotation/translation/zoom augmentation to training data.",
+        help="Apply light rotation/translation/scale augmentation to training data.",
     )
     parser.add_argument(
         "--run-name",
@@ -82,86 +90,174 @@ def parse_args():
     return parser.parse_args()
 
 
+@torch.no_grad()
+def evaluate(model, loader, criterion, device):
+    """Run a full pass over `loader`, returning (metrics_dict, y_true, y_pred)."""
+    model.eval()
+    total_loss = 0.0
+    n = 0
+    all_targets = []
+    all_probs = []
+    for images, labels in loader:
+        images, labels = images.to(device), labels.to(device)
+        logits = model(images)
+        loss = criterion(logits, labels)
+        total_loss += loss.item() * images.size(0)
+        n += images.size(0)
+        all_targets.append(labels.cpu())
+        all_probs.append(torch.sigmoid(logits).cpu())
+
+    y_true = torch.cat(all_targets)
+    y_pred = torch.cat(all_probs)
+    precision, recall = precision_recall(y_true, y_pred, threshold=PREDICTION_THRESHOLD)
+    metrics = {
+        "loss": total_loss / n,
+        "binary_accuracy": binary_accuracy(y_true, y_pred, threshold=PREDICTION_THRESHOLD),
+        "precision": precision,
+        "recall": recall,
+        "exact_match_accuracy": exact_match_accuracy(y_true, y_pred, threshold=PREDICTION_THRESHOLD),
+    }
+    return metrics, y_true, y_pred
+
+
+def train_one_epoch(model, loader, criterion, optimizer, device):
+    model.train()
+    total_loss = 0.0
+    n = 0
+    all_targets = []
+    all_probs = []
+    for images, labels in tqdm(loader, desc="train", leave=False):
+        images, labels = images.to(device), labels.to(device)
+        optimizer.zero_grad()
+        logits = model(images)
+        loss = criterion(logits, labels)
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item() * images.size(0)
+        n += images.size(0)
+        all_targets.append(labels.detach().cpu())
+        all_probs.append(torch.sigmoid(logits).detach().cpu())
+
+    y_true = torch.cat(all_targets)
+    y_pred = torch.cat(all_probs)
+    train_binary_acc = binary_accuracy(y_true, y_pred, threshold=PREDICTION_THRESHOLD)
+    return total_loss / n, train_binary_acc
+
+
 def main():
     args = parse_args()
     fix_random_seed(args.seed)
+    device = get_device(args.device)
+    print(f"Using device: {device}")
 
     run_name = args.run_name or f"{args.model}_{time.strftime('%Y%m%d_%H%M%S')}"
     run_dir = os.path.join(args.output_dir, run_name)
     os.makedirs(run_dir, exist_ok=True)
 
     print(f"Loading data from {args.data_dir} ...")
-    splits = load_splits(args.data_dir)
-    x_train, y_train, _ = splits["train"]
-    x_val, y_val, _ = splits["val"]
-    x_test, y_test, _ = splits["test"]
-    print("Train:", x_train.shape, y_train.shape)
-    print("Val:  ", x_val.shape, y_val.shape)
-    print("Test: ", x_test.shape, y_test.shape)
+    transform_train = build_augmentation() if args.augment else None
+    splits = load_splits(args.data_dir, transform_train=transform_train)
+    train_ds, val_ds, test_ds = splits["train"], splits["val"], splits["test"]
+    print("Train:", len(train_ds))
+    print("Val:  ", len(val_ds))
+    print("Test: ", len(test_ds))
 
-    input_shape = x_train.shape[1:]
-    model = MODEL_BUILDERS[args.model](input_shape=input_shape)
-    model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=args.lr),
-        loss="binary_crossentropy",
-        metrics=[
-            tf.keras.metrics.BinaryAccuracy(name="binary_accuracy"),
-            tf.keras.metrics.Precision(name="precision"),
-            tf.keras.metrics.Recall(name="recall"),
-            exact_match_accuracy,
-        ],
+    train_loader = DataLoader(
+        train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers
     )
-    model.summary()
+    val_loader = DataLoader(
+        val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers
+    )
+    test_loader = DataLoader(
+        test_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers
+    )
+
+    model = MODEL_BUILDERS[args.model]().to(device)
+    num_params = sum(p.numel() for p in model.parameters())
     with open(os.path.join(run_dir, "model_summary.txt"), "w") as f:
-        model.summary(print_fn=lambda line: f.write(line + "\n"))
+        f.write(str(model) + "\n\n")
+        f.write(f"Total parameters: {num_params:,}\n")
+    print(model)
+    print(f"Total parameters: {num_params:,}")
 
-    callbacks = [
-        tf.keras.callbacks.EarlyStopping(
-            monitor="val_loss", patience=args.patience, restore_best_weights=True
-        ),
-        tf.keras.callbacks.ReduceLROnPlateau(
-            monitor="val_loss", factor=0.5, patience=args.patience, min_lr=1e-5
-        ),
-        tf.keras.callbacks.ModelCheckpoint(
-            os.path.join(run_dir, "best_model.keras"),
-            monitor="val_loss",
-            save_best_only=True,
-        ),
-    ]
+    criterion = nn.BCEWithLogitsLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", factor=0.5, patience=args.patience, min_lr=1e-5
+    )
 
-    if args.augment:
-        augment_layer = build_augmentation()
-        train_ds = make_train_dataset(x_train, y_train, args.batch_size, augment_layer, args.seed)
-        history = model.fit(
-            train_ds,
-            validation_data=(x_val, y_val),
-            epochs=args.epochs,
-            callbacks=callbacks,
-            verbose=1,
+    history = {
+        "loss": [],
+        "val_loss": [],
+        "binary_accuracy": [],
+        "val_binary_accuracy": [],
+        "val_precision": [],
+        "val_recall": [],
+        "val_exact_match_accuracy": [],
+        "lr": [],
+    }
+
+    best_val_loss = float("inf")
+    best_state = None
+    epochs_without_improvement = 0
+
+    for epoch in range(1, args.epochs + 1):
+        train_loss, train_binary_acc = train_one_epoch(
+            model, train_loader, criterion, optimizer, device
         )
-    else:
-        history = model.fit(
-            x_train,
-            y_train,
-            validation_data=(x_val, y_val),
-            epochs=args.epochs,
-            batch_size=args.batch_size,
-            callbacks=callbacks,
-            verbose=1,
+        val_metrics, _, _ = evaluate(model, val_loader, criterion, device)
+        scheduler.step(val_metrics["loss"])
+
+        history["loss"].append(train_loss)
+        history["val_loss"].append(val_metrics["loss"])
+        history["binary_accuracy"].append(train_binary_acc)
+        history["val_binary_accuracy"].append(val_metrics["binary_accuracy"])
+        history["val_precision"].append(val_metrics["precision"])
+        history["val_recall"].append(val_metrics["recall"])
+        history["val_exact_match_accuracy"].append(val_metrics["exact_match_accuracy"])
+        history["lr"].append(optimizer.param_groups[0]["lr"])
+
+        print(
+            f"Epoch {epoch}/{args.epochs} - "
+            f"loss: {train_loss:.4f} - val_loss: {val_metrics['loss']:.4f} - "
+            f"binary_acc: {train_binary_acc:.4f} - val_binary_acc: {val_metrics['binary_accuracy']:.4f} - "
+            f"val_precision: {val_metrics['precision']:.4f} - val_recall: {val_metrics['recall']:.4f} - "
+            f"val_exact_match_acc: {val_metrics['exact_match_accuracy']:.4f}"
         )
+
+        if val_metrics["loss"] < best_val_loss:
+            best_val_loss = val_metrics["loss"]
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            epochs_without_improvement = 0
+            torch.save(
+                {"model_name": args.model, "state_dict": best_state},
+                os.path.join(run_dir, "best_model.pt"),
+            )
+        else:
+            epochs_without_improvement += 1
+            if epochs_without_improvement >= args.patience:
+                print(
+                    f"Early stopping at epoch {epoch} "
+                    f"(no val_loss improvement for {args.patience} epochs)."
+                )
+                break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
 
     plt.figure(figsize=(12, 4))
     plt.subplot(1, 2, 1)
-    plt.plot(history.history["loss"], label="train_loss")
-    plt.plot(history.history["val_loss"], label="val_loss")
+    plt.plot(history["loss"], label="train_loss")
+    plt.plot(history["val_loss"], label="val_loss")
     plt.xlabel("Epoch")
     plt.ylabel("Loss")
     plt.title("Training and validation loss")
     plt.legend()
 
     plt.subplot(1, 2, 2)
-    plt.plot(history.history["binary_accuracy"], label="train_binary_acc")
-    plt.plot(history.history["val_binary_accuracy"], label="val_binary_acc")
+    plt.plot(history["binary_accuracy"], label="train_binary_acc")
+    plt.plot(history["val_binary_accuracy"], label="val_binary_acc")
     plt.xlabel("Epoch")
     plt.ylabel("Binary Accuracy")
     plt.title("Training and validation binary accuracy")
@@ -171,16 +267,16 @@ def main():
     plt.close()
 
     with open(os.path.join(run_dir, "history.json"), "w") as f:
-        json.dump(history.history, f, indent=2)
+        json.dump(history, f, indent=2)
 
-    model.save(os.path.join(run_dir, "final_model.keras"))
+    torch.save(
+        {"model_name": args.model, "state_dict": model.state_dict()},
+        os.path.join(run_dir, "final_model.pt"),
+    )
 
     print("\nEvaluating on test set...")
-    results = model.evaluate(x_test, y_test, verbose=1)
-    test_metrics = dict(zip(model.metrics_names, results))
-
-    probs = model.predict(x_test, verbose=0)
-    pos_acc = per_position_accuracy(y_test, probs, threshold=PREDICTION_THRESHOLD)
+    test_metrics, y_true, y_pred = evaluate(model, test_loader, criterion, device)
+    pos_acc = per_position_accuracy(y_true, y_pred, threshold=PREDICTION_THRESHOLD)
 
     print("\nTest metrics:")
     for name, value in test_metrics.items():
@@ -191,7 +287,7 @@ def main():
 
     summary = {
         "model": args.model,
-        "epochs_ran": len(history.history["loss"]),
+        "epochs_ran": len(history["loss"]),
         "config": vars(args),
         "test_metrics": test_metrics,
         "per_position_accuracy": {str(d): float(a) for d, a in enumerate(pos_acc)},

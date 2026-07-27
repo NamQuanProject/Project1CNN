@@ -1,7 +1,10 @@
+# src/ pipeline (PyTorch)
 torch>=2.2
 torchvision>=0.17
-tensorflow>=2.16
 numpy>=1.26
 matplotlib>=3.8
 tqdm>=4.66
+
+# cnn/cnn.ipynb (instructor-provided TensorFlow/Keras starter notebook)
+tensorflow>=2.16
 ipykernel>=6.29

@@ -1,63 +1,81 @@
-"""CNN model builders for multi-label digit classification."""
+"""CNN model builders (PyTorch) for multi-label digit classification.
 
-from tensorflow import keras
-from tensorflow.keras import layers
+Both models return raw logits (no sigmoid) -- pair with
+nn.BCEWithLogitsLoss for numerically stable training, and apply
+torch.sigmoid() to the output at inference time.
+"""
+
+import torch.nn as nn
 
 
-def build_cnn_model(input_shape=(64, 64, 1)):
+class BaselineCNN(nn.Module):
+    """Baseline CNN, matching the architecture in cnn.ipynb (TF/Keras version):
+    3x (conv + relu + maxpool), then dense(256) + dropout(0.3) + dense(10).
     """
-    Baseline CNN, identical to the architecture in cnn.ipynb.
 
-    Sigmoid output (not softmax): each of the 10 output neurons answers
-    independently whether that digit class is present in the image.
+    def __init__(self, in_channels=1, num_classes=10, input_size=64):
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(in_channels, 32, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),
+        )
+        reduced = input_size // 8
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(128 * reduced * reduced, 256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.3),
+            nn.Linear(256, num_classes),
+        )
+
+    def forward(self, x):
+        x = self.features(x)
+        return self.classifier(x)
+
+
+class ImprovedCNN(nn.Module):
+    """Improved CNN: BatchNorm, an extra conv block, global average pooling,
+    and heavier dropout compared to the baseline. Starting point for the
+    "propose improvements" part of the lab exercise -- tune further as needed.
     """
-    inputs = keras.Input(shape=input_shape)
-    x = inputs
 
-    x = layers.Conv2D(32, kernel_size=3, activation="relu", padding="same")(x)
-    x = layers.MaxPooling2D(pool_size=2)(x)
+    def __init__(self, in_channels=1, num_classes=10, input_size=64):
+        super().__init__()
+        filters = (32, 64, 128, 128)
+        blocks = []
+        c = in_channels
+        for f in filters:
+            blocks += [
+                nn.Conv2d(c, f, kernel_size=3, padding=1, bias=False),
+                nn.BatchNorm2d(f),
+                nn.ReLU(inplace=True),
+                nn.MaxPool2d(2),
+            ]
+            c = f
+        self.features = nn.Sequential(*blocks)
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(filters[-1], 256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.4),
+            nn.Linear(256, num_classes),
+        )
 
-    x = layers.Conv2D(64, kernel_size=3, activation="relu", padding="same")(x)
-    x = layers.MaxPooling2D(pool_size=2)(x)
-
-    x = layers.Conv2D(128, kernel_size=3, activation="relu", padding="same")(x)
-    x = layers.MaxPooling2D(pool_size=2)(x)
-
-    x = layers.Flatten()(x)
-    x = layers.Dense(256, activation="relu")(x)
-    x = layers.Dropout(0.3)(x)
-
-    outputs = layers.Dense(10, activation="sigmoid")(x)
-
-    return keras.Model(inputs=inputs, outputs=outputs, name="multi_label_cnn")
-
-
-def build_improved_cnn_model(input_shape=(64, 64, 1)):
-    """
-    Improved CNN: adds batch normalization, an extra conv block, and
-    heavier regularization compared to the baseline. Starting point for
-    the "propose improvements" part of the lab exercise -- tune further
-    as needed.
-    """
-    inputs = keras.Input(shape=input_shape)
-    x = inputs
-
-    for filters in (32, 64, 128, 128):
-        x = layers.Conv2D(filters, kernel_size=3, padding="same", use_bias=False)(x)
-        x = layers.BatchNormalization()(x)
-        x = layers.Activation("relu")(x)
-        x = layers.MaxPooling2D(pool_size=2)(x)
-
-    x = layers.GlobalAveragePooling2D()(x)
-    x = layers.Dense(256, activation="relu")(x)
-    x = layers.Dropout(0.4)(x)
-
-    outputs = layers.Dense(10, activation="sigmoid")(x)
-
-    return keras.Model(inputs=inputs, outputs=outputs, name="multi_label_cnn_improved")
+    def forward(self, x):
+        x = self.features(x)
+        x = self.pool(x)
+        return self.classifier(x)
 
 
 MODEL_BUILDERS = {
-    "baseline": build_cnn_model,
-    "improved": build_improved_cnn_model,
+    "baseline": BaselineCNN,
+    "improved": ImprovedCNN,
 }

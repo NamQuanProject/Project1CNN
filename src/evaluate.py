@@ -1,7 +1,7 @@
-"""Standalone evaluation of a saved model checkpoint against the test set.
+"""Standalone evaluation of a saved PyTorch checkpoint against the test set.
 
 Usage:
-    python cnn/src/evaluate.py --model-path cnn/outputs/baseline_.../final_model.keras
+    python src/evaluate.py --model-path outputs/baseline_.../final_model.pt
 """
 
 import argparse
@@ -16,10 +16,15 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
-import tensorflow as tf
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
 
 from src.data import load_splits, multihot_to_digits
-from src.metrics import PREDICTION_THRESHOLD, exact_match_accuracy, per_position_accuracy
+from src.metrics import PREDICTION_THRESHOLD, per_position_accuracy
+from src.model import MODEL_BUILDERS
+from src.train import evaluate as run_evaluate
+from src.train import get_device
 
 DEFAULT_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data")
 DEFAULT_OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "outputs", "eval")
@@ -30,6 +35,8 @@ def parse_args():
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--data-dir", default=DEFAULT_DATA_DIR)
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda", "mps"])
     parser.add_argument("--num-samples-viz", type=int, default=12)
     return parser.parse_args()
 
@@ -37,19 +44,19 @@ def parse_args():
 def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
+    device = get_device(args.device)
 
-    model = tf.keras.models.load_model(
-        args.model_path, custom_objects={"exact_match_accuracy": exact_match_accuracy}
-    )
+    checkpoint = torch.load(args.model_path, map_location=device)
+    model = MODEL_BUILDERS[checkpoint["model_name"]]().to(device)
+    model.load_state_dict(checkpoint["state_dict"])
 
     splits = load_splits(args.data_dir)
-    x_test, y_test, meta_test = splits["test"]
+    test_ds = splits["test"]
+    test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False)
 
-    results = model.evaluate(x_test, y_test, verbose=1)
-    test_metrics = dict(zip(model.metrics_names, results))
-
-    probs = model.predict(x_test, verbose=0)
-    pos_acc = per_position_accuracy(y_test, probs, threshold=PREDICTION_THRESHOLD)
+    criterion = nn.BCEWithLogitsLoss()
+    test_metrics, y_true, y_pred = run_evaluate(model, test_loader, criterion, device)
+    pos_acc = per_position_accuracy(y_true, y_pred, threshold=PREDICTION_THRESHOLD)
 
     print("Test metrics:")
     for name, value in test_metrics.items():
@@ -66,20 +73,24 @@ def main():
     with open(os.path.join(args.output_dir, "test_metrics.json"), "w") as f:
         json.dump(summary, f, indent=2)
 
-    n = min(args.num_samples_viz, len(x_test))
-    indices = np.random.choice(len(x_test), size=n, replace=False)
-    sample_probs = model.predict(x_test[indices], verbose=0)
+    model.eval()
+    n = min(args.num_samples_viz, len(test_ds))
+    indices = np.random.choice(len(test_ds), size=n, replace=False)
+
+    images = torch.stack([test_ds[i][0] for i in indices]).to(device)
+    with torch.no_grad():
+        probs = torch.sigmoid(model(images)).cpu().numpy()
 
     rows = int(np.sqrt(n))
     cols = int(np.ceil(n / rows))
     plt.figure(figsize=(3 * cols, 3 * rows))
     for i, idx in enumerate(indices):
-        true_digits = multihot_to_digits(y_test[idx])
-        pred_digits = multihot_to_digits(sample_probs[i], threshold=PREDICTION_THRESHOLD)
-        center_label = meta_test["center_labels"][idx]
+        true_digits = multihot_to_digits(test_ds.labels[idx])
+        pred_digits = multihot_to_digits(probs[i], threshold=PREDICTION_THRESHOLD)
+        center_label = test_ds.meta["center_labels"][idx].item()
 
         plt.subplot(rows, cols, i + 1)
-        plt.imshow(x_test[idx].squeeze(), cmap="gray")
+        plt.imshow(test_ds.images[idx].numpy(), cmap="gray")
         plt.title(f"pred={pred_digits}\ntrue={true_digits}, center={center_label}", fontsize=8)
         plt.axis("off")
     plt.tight_layout()

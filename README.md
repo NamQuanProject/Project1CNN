@@ -5,9 +5,14 @@ image here contains **multiple digits**, and the model must predict the full set
 digit classes present (a 10-dim multi-hot vector, one entry per digit `0`-`9`).
 
 See [`task.txt`](task.txt) for the full assignment description and
-[`cnn/cnn.ipynb`](cnn/cnn.ipynb) for the original notebook (dataset walkthrough,
-metric explanations, baseline model, and the lab exercise instructions in its final
-cell).
+[`cnn/cnn.ipynb`](cnn/cnn.ipynb) for the instructor-provided starter notebook
+(dataset walkthrough, metric explanations, TensorFlow/Keras baseline model, and the
+lab exercise instructions in its final cell).
+
+The `src/` pipeline below is an independent **PyTorch** reimplementation of the same
+task — same architecture, data, and metrics as the notebook's baseline, but as a
+headless, script-based pipeline instead of a TF/Keras notebook. It does not depend on
+`cnn.ipynb`, and `cnn.ipynb` does not depend on it.
 
 ## Project layout
 
@@ -15,13 +20,13 @@ cell).
 task.txt                  Assignment description
 requirements.txt          Python dependencies
 cnn/
-  cnn.ipynb                Original notebook: data walkthrough, baseline model, exercise instructions
+  cnn.ipynb                Instructor-provided notebook (TensorFlow/Keras baseline + exercise instructions)
 data/
   train.pt, val.pt, test.pt   Dataset splits (images + multi-hot labels + metadata)
-src/
-  data.py                Load .pt splits into Keras-friendly numpy arrays
-  metrics.py              exact_match_accuracy, per_position_accuracy
-  model.py                 build_cnn_model (baseline) and build_improved_cnn_model
+src/                      PyTorch pipeline (independent of cnn.ipynb)
+  data.py                MultiLabelDigitsDataset, load_splits
+  metrics.py              exact_match_accuracy, per_position_accuracy, binary_accuracy, precision_recall
+  model.py                 BaselineCNN and ImprovedCNN (nn.Module)
   train.py                 Headless training entrypoint (CLI)
   evaluate.py               Re-evaluate a saved checkpoint on the test set
   compare.py                 Diff two runs' test_metrics.json into a comparison table
@@ -29,10 +34,27 @@ outputs/                  Generated per-run artifacts (git-ignored)
 ```
 
 `data/` and `src/` are kept at the repo root, separate from `cnn/` (which holds only
-the original notebook) — the pipeline scripts don't depend on the notebook or vice
-versa. `cnn/cnn.ipynb` loads data via `../data/*.pt` since it lives one level down in
-`cnn/`; `src/train.py` and `src/evaluate.py` default to `<repo root>/data` and
-`<repo root>/outputs` regardless of the current working directory.
+the original notebook). `cnn/cnn.ipynb` loads data via `../data/*.pt` since it lives
+one level down in `cnn/`; `src/train.py` and `src/evaluate.py` default to
+`<repo root>/data` and `<repo root>/outputs` regardless of the current working
+directory.
+
+### PyTorch pipeline details
+
+- Models (`src/model.py`) return raw **logits**, not sigmoid probabilities — training
+  uses `nn.BCEWithLogitsLoss` for numerical stability, and `torch.sigmoid()` is
+  applied only at evaluation/inference time.
+- `BaselineCNN` has the identical layer structure (and identical parameter count —
+  2,192,650) to the notebook's Keras baseline: 3x (conv + ReLU + maxpool) with
+  32/64/128 filters, then dense(256) + dropout(0.3) + dense(10).
+- `--device` auto-selects CUDA, then Apple Silicon MPS, then CPU (override with
+  `--device cpu|cuda|mps`).
+- Early stopping and `ReduceLROnPlateau` are reimplemented manually (PyTorch has no
+  Keras-style callbacks): both watch `val_loss` with the same `--patience`, and the
+  best-val-loss weights are restored before the final save/evaluation, mirroring the
+  notebook's `EarlyStopping(restore_best_weights=True)`.
+- `--augment` applies light random rotation/translation/scale (`torchvision.transforms`)
+  to the training split only.
 
 ## Setup
 
@@ -61,20 +83,20 @@ python src/train.py --model improved --augment --run-name improved_v1
 ```
 
 Each run writes to `outputs/<run-name>/`:
-- `model_summary.txt` — layer-by-layer architecture
+- `model_summary.txt` — layer-by-layer architecture and parameter count
 - `training_curves.png` — loss / binary-accuracy curves
 - `history.json` — full per-epoch training history
-- `best_model.keras`, `final_model.keras` — saved checkpoints
+- `best_model.pt`, `final_model.pt` — saved checkpoints (`{"model_name", "state_dict"}`)
 - `test_metrics.json` — test-set loss, binary_accuracy, precision, recall,
   exact_match_accuracy, and per-digit (per-position) accuracy
 
-Useful flags: `--epochs`, `--batch-size`, `--lr`, `--patience`, `--seed`,
+Useful flags: `--epochs`, `--batch-size`, `--lr`, `--patience`, `--seed`, `--device`,
 `--data-dir`, `--output-dir`. Run `python src/train.py --help` for the full list.
 
 ### Re-evaluating a saved checkpoint
 
 ```bash
-python src/evaluate.py --model-path outputs/baseline_<timestamp>/final_model.keras
+python src/evaluate.py --model-path outputs/baseline_<timestamp>/final_model.pt
 ```
 
 Writes `test_metrics.json` and a `sample_predictions.png` grid to
