@@ -96,6 +96,27 @@ def resolve_hparam(value, model_name, key, fallback):
     return MODEL_HPARAM_DEFAULTS.get(model_name, {}).get(key, fallback)
 
 
+# "higher is better" for every metric except loss.
+MONITOR_MODE_BY_METRIC = {"loss": "min"}
+
+
+def is_better(current, best, mode):
+    return current > best if mode == "max" else current < best
+
+
+def smooth_labels(labels, label_smoothing):
+    """Soften hard 0/1 multi-label targets toward 0.5, applied only to the
+    *training* loss (never to metrics, or to val/test loss) -- standard
+    label smoothing, adapted for BCE since nn.BCEWithLogitsLoss has no
+    built-in label_smoothing option (unlike CrossEntropyLoss). Useful here
+    since overlapping/occluded digits make some labels genuinely ambiguous;
+    softening discourages the model from being overconfident about them.
+    """
+    if label_smoothing <= 0.0:
+        return labels
+    return labels * (1 - label_smoothing) + 0.5 * label_smoothing
+
+
 def resolve_amp_dtype(device, amp_mode):
     """Resolve --amp {auto,on,off} to an autocast dtype, or None to disable.
 
@@ -203,6 +224,35 @@ def parse_args():
         help="Gradient clipping max-norm (0 disables). Defaults to the model's recommendation.",
     )
     parser.add_argument("--patience", type=int, default=None, help="Early-stopping patience in epochs.")
+    parser.add_argument(
+        "--lr-patience",
+        type=int,
+        default=None,
+        help="Patience (epochs) for the 'plateau' scheduler's LR reduction. Defaults to the model's "
+        "recommendation, or --patience if the model doesn't specify one (the old coupled behavior).",
+    )
+    parser.add_argument(
+        "--min-lr", type=float, default=None, help="Floor LR for the 'plateau' scheduler. Defaults per-model."
+    )
+    parser.add_argument(
+        "--monitor-metric",
+        choices=["loss", "binary_accuracy", "precision", "recall", "exact_match_accuracy"],
+        default=None,
+        help="Validation metric used for early-stopping and best-checkpoint selection. Defaults to "
+        "the model's recommendation, or 'loss' otherwise.",
+    )
+    parser.add_argument(
+        "--monitor-mode",
+        choices=["min", "max"],
+        default=None,
+        help="Defaults to 'min' for --monitor-metric loss, 'max' for every other metric.",
+    )
+    parser.add_argument(
+        "--label-smoothing",
+        type=float,
+        default=None,
+        help="Softens 0/1 BCE targets toward 0.5 by this amount (training loss only). Defaults per-model.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--num-workers",
@@ -304,6 +354,7 @@ def train_one_epoch(
     channels_last,
     ema,
     step_scheduler,
+    label_smoothing=0.0,
 ):
     model.train()
     total_loss = 0.0
@@ -322,7 +373,7 @@ def train_one_epoch(
         optimizer.zero_grad(set_to_none=True)
         with autocast_ctx:
             logits = model(images)
-            loss = criterion(logits, labels)
+            loss = criterion(logits, smooth_labels(labels, label_smoothing))
 
         if scaler is not None:
             scaler.scale(loss).backward()
@@ -376,6 +427,16 @@ def main():
     warmup_epochs = resolve_hparam(args.warmup_epochs, args.model, "warmup_epochs", 0)
     grad_clip_norm = resolve_hparam(args.grad_clip_norm, args.model, "grad_clip_norm", 0.0)
     patience = resolve_hparam(args.patience, args.model, "patience", 5)
+    # lr_patience/min_lr are for ReduceLROnPlateau specifically; fall back to
+    # the early-stopping `patience` (old coupled behavior) if a model doesn't
+    # give its own recommendation.
+    lr_patience = resolve_hparam(args.lr_patience, args.model, "lr_patience", patience)
+    min_lr = resolve_hparam(args.min_lr, args.model, "min_lr", 1e-5)
+    monitor_metric = resolve_hparam(args.monitor_metric, args.model, "monitor_metric", "loss")
+    monitor_mode = args.monitor_mode or resolve_hparam(
+        None, args.model, "monitor_mode", MONITOR_MODE_BY_METRIC.get(monitor_metric, "max")
+    )
+    label_smoothing = resolve_hparam(args.label_smoothing, args.model, "label_smoothing", 0.0)
     pretrained = resolve_hparam(args.pretrained, args.model, "pretrained", False)
     ema_enabled = resolve_hparam(args.ema, args.model, "ema", False)
     ema_decay = resolve_hparam(args.ema_decay, args.model, "ema_decay", 0.999)
@@ -384,7 +445,8 @@ def main():
         f"Hyperparameters: lr={lr}, backbone_lr={backbone_lr}, optimizer={optimizer_name}, "
         f"weight_decay={weight_decay}, batch_size={batch_size}, scheduler={scheduler_type}, "
         f"warmup_epochs={warmup_epochs}, grad_clip_norm={grad_clip_norm}, patience={patience}, "
-        f"pretrained={pretrained}, ema={ema_enabled} (decay={ema_decay})"
+        f"lr_patience={lr_patience}, min_lr={min_lr}, monitor={monitor_metric} ({monitor_mode}), "
+        f"label_smoothing={label_smoothing}, pretrained={pretrained}, ema={ema_enabled} (decay={ema_decay})"
     )
 
     amp_dtype = resolve_amp_dtype(device, args.amp)
@@ -483,7 +545,14 @@ def main():
         )
     else:
         plateau_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="min", factor=0.5, patience=patience, min_lr=1e-5
+            # Always watches val_loss regardless of --monitor-metric: LR
+            # plateau-reduction and early-stopping/checkpoint-selection are
+            # deliberately separate concerns (see MODEL_HPARAM_DEFAULTS["resnet"]).
+            optimizer,
+            mode="min",
+            factor=0.5,
+            patience=lr_patience,
+            min_lr=min_lr,
         )
 
     history = {
@@ -497,7 +566,7 @@ def main():
         "lr": [],
     }
 
-    best_val_loss = float("inf")
+    best_monitor_value = float("-inf") if monitor_mode == "max" else float("inf")
     best_state = None
     best_ema_state = None
     epochs_without_improvement = 0
@@ -516,6 +585,7 @@ def main():
             channels_last,
             ema,
             step_scheduler,
+            label_smoothing,
         )
 
         eval_model = ema.shadow if ema is not None else model
@@ -541,8 +611,9 @@ def main():
             f"lr: {optimizer.param_groups[0]['lr']:.2e}"
         )
 
-        if val_metrics["loss"] < best_val_loss:
-            best_val_loss = val_metrics["loss"]
+        current_monitor_value = val_metrics[monitor_metric]
+        if is_better(current_monitor_value, best_monitor_value, monitor_mode):
+            best_monitor_value = current_monitor_value
             best_state = {k: v.detach().cpu().clone() for k, v in raw_model.state_dict().items()}
             best_ema_state = (
                 {k: v.detach().cpu().clone() for k, v in ema.shadow.state_dict().items()} if ema is not None else None
@@ -560,7 +631,10 @@ def main():
         else:
             epochs_without_improvement += 1
             if epochs_without_improvement >= patience:
-                print(f"Early stopping at epoch {epoch} (no val_loss improvement for {patience} epochs).")
+                print(
+                    f"Early stopping at epoch {epoch} "
+                    f"(no val_{monitor_metric} improvement for {patience} epochs)."
+                )
                 break
 
     if best_state is not None:
@@ -630,6 +704,11 @@ def main():
             "warmup_epochs": warmup_epochs,
             "grad_clip_norm": grad_clip_norm,
             "patience": patience,
+            "lr_patience": lr_patience,
+            "min_lr": min_lr,
+            "monitor_metric": monitor_metric,
+            "monitor_mode": monitor_mode,
+            "label_smoothing": label_smoothing,
             "pretrained": pretrained,
             "ema": ema_enabled,
             "ema_decay": ema_decay,

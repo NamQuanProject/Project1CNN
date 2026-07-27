@@ -57,22 +57,51 @@ directory.
   split only: rotation+translation+scale for `baseline`/`improved`, or
   translation+zoom+contrast (no rotation/flip) for `resnet`.
 - `--lr`, `--backbone-lr`, `--optimizer`, `--weight-decay`, `--batch-size`,
-  `--scheduler`, `--warmup-epochs`, `--grad-clip-norm`, `--patience`, `--ema`,
+  `--scheduler`, `--warmup-epochs`, `--grad-clip-norm`, `--patience`, `--lr-patience`,
+  `--min-lr`, `--monitor-metric`, `--monitor-mode`, `--label-smoothing`, `--ema`,
   `--ema-decay` all default to `None`/`auto`, which resolves to each model's
   recommended setting (`MODEL_HPARAM_DEFAULTS` in `src/model.py`) — pass any of them
   explicitly to override.
 
 ### Improvement 2: `resnet`
 
-`ResNetCNN` (`src/model.py`) replaces the plain conv stack with 3 residual blocks
-(Conv → BN → ReLU ×2 + skip connection, filters 32 → 64 → 128, each downsampling by
-2), and replaces the Flatten→Dense(256)→Dropout head — the source of the baseline's
-~2.1M dense-layer parameters and its main overfitting driver — with
-SpatialDropout(0.15) → GlobalAveragePooling → Dropout(0.35) → Linear(10) (309K params
-total). When `--model resnet` is selected, `train.py` defaults to `AdamW(lr=3e-4,
-weight_decay=1e-4)` and, with `--augment`, applies only translate/zoom/contrast
-jitter — no rotation or flip, since those can turn a `6` into a `9` (or vice versa)
-and corrupt the label.
+`ResNetCNN` (`src/model.py`) replaces the plain conv stack with residual blocks, and
+replaces the Flatten→Dense(256)→Dropout head — the source of the baseline's ~2.1M
+dense-layer parameters and its main overfitting driver — with SpatialDropout(0.15) →
+GlobalAveragePooling → Dropout(0.35) → Linear(10) (~688K params total).
+
+The block topology matches a reference implementation (a classmate's
+`assignment1_cnn.py`) that reached ~80% exact-match accuracy on this dataset — 5
+residual blocks (res1 32ch/stride1 → res2 64ch/stride2 → res3 64ch/stride1 → res4
+128ch/stride2 → res5 128ch/stride1), where only 2 of the 5 blocks downsample. That
+keeps a 16×16 feature map into the classifier instead of 8×8 (the earlier 3-block
+version here, which downsampled at every block) — more spatial detail available for
+separating several small, overlapping digits. The "same-resolution" blocks
+(res1/res3/res5) add extra nonlinear depth per scale instead of immediately
+discarding resolution. Conv weights use explicit Kaiming-normal ("he_normal") init,
+matching the reference and standard practice for ReLU networks.
+
+Layered on top of that reference recipe:
+
+- **Squeeze-and-Excitation** channel attention in every residual block (`SqueezeExcite`
+  in `src/model.py`) — a cheap gate that lets the network reweight which feature
+  channels matter for a given input (e.g. suppress channels mostly responding to a
+  distractor digit).
+- **Stochastic depth / DropPath** — randomly skips the residual branch for some
+  training samples, with drop probability increasing with depth (0 → 0.1 across the
+  5 blocks), regularizing the extra capacity from the added blocks/SE gates.
+- **EMA of weights** (on by default, decay `0.9995`) and **label smoothing** (`0.05`,
+  applied to the training BCE loss only — never to metrics or val/test loss; softens
+  hard 0/1 targets toward 0.5, useful since overlapping/occluded digits make some
+  labels genuinely ambiguous).
+- **Early-stopping and best-checkpoint selection watch `exact_match_accuracy`
+  directly** (`--monitor-metric`, mode `max`) instead of `val_loss` — the metric that
+  actually matters for this task, which can keep improving even while `val_loss` is
+  flat. This is decoupled from the LR-plateau reduction, which still watches
+  `val_loss` with its own, more patient schedule (`--lr-patience 3`, `--min-lr 1e-6`,
+  vs. `--patience 10` for early stopping) — matching the reference recipe's dual
+  callback setup (`EarlyStopping` on `val_exact_match_accuracy`,
+  `ReduceLROnPlateau` on `val_loss`).
 
 ```bash
 python src/train.py --model resnet --augment --run-name resnet_v1
