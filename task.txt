@@ -1,0 +1,7 @@
+In this exercise, students will work on a multi-label image classification problem using a Convolutional Neural Network (CNN). Unlike standard digit classification, where each image contains only one digit, each input image in this exercise may contain multiple digits. Therefore, the model must predict the complete set of digits appearing in each image.
+
+Students are expected to run the baseline CNN model, analyze its performance, and propose improvements to achieve a higher exact_match_accuracy on the test set. Possible improvements may include modifying the CNN architecture, changing training settings, applying regularization, or using other suitable techniques.
+
+Students may work in groups of up to three. Each group must submit one .zip file containing the completed notebook and a PDF report.
+
+Please read the guidelines in the notebook carefully before starting the exercise
