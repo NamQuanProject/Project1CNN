@@ -26,7 +26,7 @@ data/
 src/                      PyTorch pipeline (independent of cnn.ipynb)
   data.py                MultiLabelDigitsDataset, load_splits
   metrics.py              exact_match_accuracy, per_position_accuracy, binary_accuracy, precision_recall
-  model.py                 BaselineCNN and ImprovedCNN (nn.Module)
+  model.py                 BaselineCNN, ImprovedCNN, ResNetCNN (nn.Module)
   train.py                 Headless training entrypoint (CLI)
   evaluate.py               Re-evaluate a saved checkpoint on the test set
   compare.py                 Diff two runs' test_metrics.json into a comparison table
@@ -53,8 +53,28 @@ directory.
   Keras-style callbacks): both watch `val_loss` with the same `--patience`, and the
   best-val-loss weights are restored before the final save/evaluation, mirroring the
   notebook's `EarlyStopping(restore_best_weights=True)`.
-- `--augment` applies light random rotation/translation/scale (`torchvision.transforms`)
-  to the training split only.
+- `--augment` applies light augmentation (`torchvision.transforms`) to the training
+  split only: rotation+translation+scale for `baseline`/`improved`, or
+  translation+zoom+contrast (no rotation/flip) for `resnet`.
+- `--lr`, `--optimizer`, `--weight-decay` default to `None`, which resolves to each
+  model's recommended setting (`MODEL_HPARAM_DEFAULTS` in `src/model.py`) — pass any
+  of them explicitly to override.
+
+### Improvement 2: `resnet`
+
+`ResNetCNN` (`src/model.py`) replaces the plain conv stack with 3 residual blocks
+(Conv → BN → ReLU ×2 + skip connection, filters 32 → 64 → 128, each downsampling by
+2), and replaces the Flatten→Dense(256)→Dropout head — the source of the baseline's
+~2.1M dense-layer parameters and its main overfitting driver — with
+SpatialDropout(0.15) → GlobalAveragePooling → Dropout(0.35) → Linear(10) (309K params
+total). When `--model resnet` is selected, `train.py` defaults to `AdamW(lr=3e-4,
+weight_decay=1e-4)` and, with `--augment`, applies only translate/zoom/contrast
+jitter — no rotation or flip, since those can turn a `6` into a `9` (or vice versa)
+and corrupt the label.
+
+```bash
+python src/train.py --model resnet --augment --run-name resnet_v1
+```
 
 ## Setup
 

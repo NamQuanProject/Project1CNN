@@ -1,10 +1,11 @@
 """CNN model builders (PyTorch) for multi-label digit classification.
 
-Both models return raw logits (no sigmoid) -- pair with
+All models return raw logits (no sigmoid) -- pair with
 nn.BCEWithLogitsLoss for numerically stable training, and apply
 torch.sigmoid() to the output at inference time.
 """
 
+import torch
 import torch.nn as nn
 
 
@@ -75,7 +76,89 @@ class ImprovedCNN(nn.Module):
         return self.classifier(x)
 
 
+class ResidualBlock(nn.Module):
+    """Basic residual block: (Conv -> BN -> ReLU) x2 with a skip connection.
+
+    Downsamples by stride 2 in the first conv when `downsample=True`; the
+    shortcut path uses a matching 1x1 stride-2 conv + BN so it can be added
+    to the main path.
+    """
+
+    def __init__(self, in_channels, out_channels, downsample=True):
+        super().__init__()
+        stride = 2 if downsample else 1
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+
+        self.shortcut = None
+        if downsample or in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(out_channels),
+            )
+
+    def forward(self, x):
+        identity = self.shortcut(x) if self.shortcut is not None else x
+        out = self.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        return self.relu(out + identity)
+
+
+class ResNetCNN(nn.Module):
+    """Improvement 2: replaces the plain conv stack with residual blocks.
+
+    - A 3x3 stem conv (no downsampling), then 3 residual stages with
+      filters 32 -> 64 -> 128, each downsampling by 2 (64x64 -> 8x8, same
+      total reduction as the baseline's 3 maxpools).
+    - Head: SpatialDropout (nn.Dropout2d) -> GlobalAveragePooling ->
+      Dropout(0.35) -> Linear(10). No Flatten/Dense(256): the baseline's
+      ~2.1M dense-layer parameters were the main source of overfitting, so
+      this head is deliberately much smaller.
+    - Pair with AdamW(lr=3e-4, weight_decay=1e-4) and augmentation that
+      avoids rotation/flip (translate + zoom + contrast only), since
+      rotating/flipping digits can turn a 6 into a 9 or vice versa.
+    """
+
+    def __init__(self, in_channels=1, num_classes=10):
+        super().__init__()
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_channels, 32, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+        )
+        self.layer1 = ResidualBlock(32, 32, downsample=True)
+        self.layer2 = ResidualBlock(32, 64, downsample=True)
+        self.layer3 = ResidualBlock(64, 128, downsample=True)
+
+        self.spatial_dropout = nn.Dropout2d(0.15)
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.dropout = nn.Dropout(0.35)
+        self.fc = nn.Linear(128, num_classes)
+
+    def forward(self, x):
+        x = self.stem(x)
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.spatial_dropout(x)
+        x = self.pool(x)
+        x = torch.flatten(x, 1)
+        x = self.dropout(x)
+        return self.fc(x)
+
+
 MODEL_BUILDERS = {
     "baseline": BaselineCNN,
     "improved": ImprovedCNN,
+    "resnet": ResNetCNN,
+}
+
+# Recommended hyperparameters per model, applied in train.py when the
+# corresponding CLI flag is left at its default (None -> "use the model's
+# recommendation"). Explicit --lr / --optimizer / --weight-decay always win.
+MODEL_HPARAM_DEFAULTS = {
+    "resnet": {"lr": 3e-4, "optimizer": "adamw", "weight_decay": 1e-4},
 }

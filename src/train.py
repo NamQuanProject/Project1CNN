@@ -33,7 +33,7 @@ from src.metrics import (
     per_position_accuracy,
     precision_recall,
 )
-from src.model import MODEL_BUILDERS
+from src.model import MODEL_BUILDERS, MODEL_HPARAM_DEFAULTS
 
 DEFAULT_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data")
 DEFAULT_OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "outputs")
@@ -56,13 +56,32 @@ def get_device(preference="auto"):
     return torch.device("cpu")
 
 
-def build_augmentation():
+def build_augmentation(model_name):
+    """Light training-time augmentation. No rotation/flip for "resnet": that
+    can turn a 6 into a 9 (or vice versa) and corrupt the labels.
+    """
+    if model_name == "resnet":
+        return transforms.Compose(
+            [
+                # Keras RandomTranslation(0.04, 0.04) / RandomZoom(-0.08, 0.08).
+                transforms.RandomAffine(degrees=0, translate=(0.04, 0.04), scale=(0.92, 1.08)),
+                # Keras RandomContrast(0.12).
+                transforms.ColorJitter(contrast=0.12),
+            ]
+        )
     return transforms.Compose(
         [
             transforms.RandomRotation(degrees=10),
             transforms.RandomAffine(degrees=0, translate=(0.05, 0.05), scale=(0.95, 1.05)),
         ]
     )
+
+
+def resolve_hparam(value, model_name, key, fallback):
+    """CLI value wins if given; otherwise use the model's recommended default."""
+    if value is not None:
+        return value
+    return MODEL_HPARAM_DEFAULTS.get(model_name, {}).get(key, fallback)
 
 
 def parse_args():
@@ -72,7 +91,21 @@ def parse_args():
     parser.add_argument("--model", choices=sorted(MODEL_BUILDERS), default="baseline")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=128)
-    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument(
+        "--lr", type=float, default=None, help="Defaults to the model's recommended lr (see MODEL_HPARAM_DEFAULTS)."
+    )
+    parser.add_argument(
+        "--optimizer",
+        choices=["adam", "adamw"],
+        default=None,
+        help="Defaults to the model's recommended optimizer (adamw for resnet, else adam).",
+    )
+    parser.add_argument(
+        "--weight-decay",
+        type=float,
+        default=None,
+        help="Defaults to the model's recommended weight decay (1e-4 for resnet, else 0.0).",
+    )
     parser.add_argument("--patience", type=int, default=5)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-workers", type=int, default=0)
@@ -80,7 +113,8 @@ def parse_args():
     parser.add_argument(
         "--augment",
         action="store_true",
-        help="Apply light rotation/translation/scale augmentation to training data.",
+        help="Apply light augmentation to training data (rotation+translate+scale, "
+        "or for --model resnet: translate+zoom+contrast only, no rotation/flip).",
     )
     parser.add_argument(
         "--run-name",
@@ -155,8 +189,13 @@ def main():
     run_dir = os.path.join(args.output_dir, run_name)
     os.makedirs(run_dir, exist_ok=True)
 
+    lr = resolve_hparam(args.lr, args.model, "lr", 1e-3)
+    optimizer_name = resolve_hparam(args.optimizer, args.model, "optimizer", "adam")
+    weight_decay = resolve_hparam(args.weight_decay, args.model, "weight_decay", 0.0)
+    print(f"Hyperparameters: lr={lr}, optimizer={optimizer_name}, weight_decay={weight_decay}")
+
     print(f"Loading data from {args.data_dir} ...")
-    transform_train = build_augmentation() if args.augment else None
+    transform_train = build_augmentation(args.model) if args.augment else None
     splits = load_splits(args.data_dir, transform_train=transform_train)
     train_ds, val_ds, test_ds = splits["train"], splits["val"], splits["test"]
     print("Train:", len(train_ds))
@@ -182,7 +221,8 @@ def main():
     print(f"Total parameters: {num_params:,}")
 
     criterion = nn.BCEWithLogitsLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    optimizer_cls = torch.optim.AdamW if optimizer_name == "adamw" else torch.optim.Adam
+    optimizer = optimizer_cls(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=0.5, patience=args.patience, min_lr=1e-5
     )
@@ -289,6 +329,7 @@ def main():
         "model": args.model,
         "epochs_ran": len(history["loss"]),
         "config": vars(args),
+        "resolved_hparams": {"lr": lr, "optimizer": optimizer_name, "weight_decay": weight_decay},
         "test_metrics": test_metrics,
         "per_position_accuracy": {str(d): float(a) for d, a in enumerate(pos_acc)},
     }
