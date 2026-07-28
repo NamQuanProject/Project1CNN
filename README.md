@@ -44,58 +44,63 @@ directory.
 
 `src/model.py` defines one architecture, built from a few small pieces:
 
-- **`CBAM`** — Convolutional Block Attention Module (Woo et al., ECCV 2018,
-  [arxiv.org/abs/1807.06521](https://arxiv.org/abs/1807.06521)), applying two
-  sub-modules in sequence:
-  - **`ChannelAttention`** — like Squeeze-Excitation, a gate that reweights each
-    feature channel by how useful it is for the current input, but pools with
-    *both* average **and** max (through a shared MLP) rather than average only —
-    the paper's ablations found this gives a "finer" channel descriptor.
-  - **`SpatialAttention`** — pools *across the channel axis* (avg and max) to get
-    two single-channel H×W maps, concatenates them, and runs a 7×7 conv + sigmoid
-    to produce a per-pixel gate. This is genuinely new information channel-only
-    attention (SE, or CBAM's own channel module) can't represent: *which pixel
-    locations* matter, not just which channels — directly relevant here since the
-    digits that matter occupy varying, specific regions among overlapping
-    distractors.
+- **`ECA`** — Efficient Channel Attention (Wang et al., CVPR 2020,
+  [arxiv.org/abs/1910.03151](https://arxiv.org/abs/1910.03151)). Two earlier channel
+  gates were tried and superseded here: plain Squeeze-Excitation (a
+  channels→hidden→channels MLP bottleneck), then CBAM (channel + spatial
+  attention) — CBAM empirically underperformed SE on this dataset/training budget.
+  ECA replaces both: the ECA paper argues SE's dimensionality-reduction bottleneck
+  actually *hurts* channel-attention quality (not just a compute/quality
+  trade-off), so ECA instead runs a single lightweight 1D conv directly over the
+  pooled per-channel descriptor — cheaper than SE (no bottleneck, ~3-5 params per
+  gate vs. thousands) and, per the paper, more effective.
 - **`DropPath`** — stochastic depth (Huang et al., 2016): randomly drops the entire
   residual branch for some training samples, an ensembling-style regularizer.
-- **`ResidualBlock`** — `(Conv → BN → ReLU) × 2` with a skip connection, plus CBAM
-  and DropPath applied to the residual branch before the skip-add.
+- **`ResidualBlock`** — `(Conv → BN → SiLU) × 2` with a skip connection, plus ECA
+  and DropPath applied to the residual branch before the skip-add. Uses SiLU
+  (`x * sigmoid(x)`) instead of ReLU: smooth and non-zero everywhere (no "dead
+  unit" gradient collapse the way ReLU can have), which several modern CNN designs
+  (EfficientNet and others) found to outperform ReLU slightly at negligible cost.
 
-**`ResNetCNN`** assembles these into (block topology matches a reference
+**`ResNetCNN`** assembles these into (block topology originally matched a reference
 implementation — a classmate's `assignment1_cnn.py` — that reached ~80% exact-match
-accuracy on this dataset):
+accuracy on this dataset; since widened/deepened):
 
-- **Stem**: a single 3×3 conv+BN+ReLU, no downsampling (stays at 64×64).
-- **6 residual blocks**: res1 (32ch, stride 1) → res2 (64ch, stride 2) → res3 (64ch,
-  stride 1) → res4 (128ch, stride 2) → res5/res6 (128ch, stride 1). Only 2 of the 6
-  blocks downsample (64×64 → 32×32 → 16×16), keeping more spatial detail into the
-  final feature map than a "downsample every block" design (which would end at
-  8×8) — that matters for separating several small, overlapping digits. The
-  "same-resolution" blocks (res1/res3/res5/res6) add extra nonlinear depth per
-  scale instead of immediately discarding resolution.
+- **Stem**: a single 3×3 conv+BN+SiLU, no downsampling (stays at 64×64), outputting
+  64 channels.
+- **12 residual blocks in 3 stages of 4**, channels 64 → 128 → 256: stage 1 (64ch,
+  64×64) → stage 2 (128ch, 32×32) → stage 3 (256ch, 16×16). Only the first block of
+  each of stage 2/3 downsamples — same "don't over-downsample" philosophy as
+  before (a "downsample every block" design would end at a much smaller map,
+  hurting separation of several small, overlapping digits), just with more blocks
+  per stage and more channels per stage. The 3 same-resolution blocks per stage add
+  nonlinear depth before handing off to the next (downsampling + widening) stage.
 - Drop probability for stochastic depth increases with block depth (0 → 0.1 across
-  the blocks, deeper blocks being more overfitting-prone).
+  the 12 blocks, deeper blocks being more overfitting-prone) — regularization to
+  offset the substantially larger capacity of this configuration.
 - **Head**: SpatialDropout (`nn.Dropout2d`, 0.15) → GlobalAveragePooling →
-  Dropout(0.35) → `Linear(128, 10)`. No `Flatten`/`Dense(256)`: avoids a large dense
-  classifier, historically the main source of overfitting for this dataset size
-  (~50K training images).
-- Conv weights use explicit Kaiming-normal ("he_normal") init, matching the reference
-  implementation and standard practice for ReLU networks (PyTorch's default conv init
-  is a Kaiming *uniform* variant, less well suited to deep ReLU stacks).
-- **~981K total parameters** — CBAM itself adds almost nothing (~2.3K params per
-  block: the channel-attention MLP is shared between its avg/max branches, so the
-  max-pool addition is free; the spatial-attention 7×7 conv is only 98 params). A
-  ResNet-50 backbone was also tried on this task and badly overfit at 23.5M
-  parameters for a ~50K-image dataset — this architecture is deliberately kept an
-  order of magnitude smaller than that.
+  Dropout(0.35) → `Linear(256, 10)`. No `Flatten`/`Dense(256-unit-MLP)`: avoids a
+  large dense classifier, historically the main source of overfitting for this
+  dataset size (~50K training images).
+- Conv weights use explicit Kaiming-normal ("he_normal") init (`nonlinearity="relu"`
+  for the gain calculation, the standard stand-in for SiLU/Swish since PyTorch has
+  no dedicated entry — both behave near-linearly for positive inputs).
+- **~5.9M total parameters.** A ResNet-50 backbone was also tried on this task and
+  badly overfit at 23.5M parameters for a ~50K-image dataset — this configuration
+  sits at roughly a quarter of that, deliberately paired with MixUp (below) as
+  extra regularization to offset the larger capacity than the ~988K/0.88-exact-match
+  configuration this was widened from.
 - Returns raw **logits**, not sigmoid probabilities — pair with one of the losses
   below, and apply `torch.sigmoid()` only at evaluation/inference time.
 
 ```bash
-python src/train.py --augment --run-name resnet_v1
+python src/train.py --augment --run-name resnet_v2
 ```
+
+**Possible next step**: migrating to a full ConvNeXt-style block (depthwise 7×7
+convs, LayerNorm, inverted-bottleneck MLP with GELU, layer scale) is a materially
+different architecture family from the ResNet lineage above, not an incremental
+change — worth its own separate pass if you want to go there next.
 
 ## Full parameter reference (`python src/train.py`)
 
@@ -114,16 +119,17 @@ list from argparse itself.
 | `--lr` | float | `3e-4` | Learning rate. |
 | `--optimizer` | `adam`\|`adamw` | `adamw` | Optimizer. Weight decay only applies to `adamw`. |
 | `--weight-decay` | float | `1e-4` | L2 weight decay — applied only to conv/linear weights, never BatchNorm scale/shift or biases (`build_param_groups()` splits them out; decaying those hurts normalization for no benefit). |
-| `--scheduler` | `plateau`\|`cosine_warmup` | `plateau` | LR schedule. `plateau` = `ReduceLROnPlateau` on val loss; `cosine_warmup` = linear warmup then cosine decay, stepped every batch. |
+| `--scheduler` | `plateau`\|`cosine_warmup`\|`cosine` | `cosine` | LR schedule. `cosine` = plain `CosineAnnealingLR` (`T_max=epochs`, `eta_min=--min-lr`), stepped once per epoch, no warmup. `plateau` = `ReduceLROnPlateau` on val loss. `cosine_warmup` = linear warmup then cosine decay, stepped every batch. |
 | `--warmup-epochs` | int | `0` | Warmup length, only used by `--scheduler cosine_warmup`. |
-| `--lr-patience` | int | `3` | Epochs of no val-loss improvement before `plateau` halves the LR. Independent of `--patience` (see below) — falls back to `--patience`'s value if not set. |
-| `--min-lr` | float | `1e-6` | Floor LR for the `plateau` scheduler. |
-| `--patience` | int | `10` | Epochs of no improvement (on `--monitor-metric`) before early stopping. |
-| `--monitor-metric` | `loss`\|`binary_accuracy`\|`precision`\|`recall`\|`exact_match_accuracy` | `exact_match_accuracy` | Validation metric used for early-stopping and best-checkpoint selection. Independent of the `plateau` scheduler, which always watches val loss regardless of this flag. |
+| `--lr-patience` | int | `3` | Epochs of no val-loss improvement before `plateau` halves the LR. Only relevant for `--scheduler plateau`. Independent of `--patience` (see below). |
+| `--min-lr` | float | `1e-6` | Floor LR — `eta_min` for `cosine`, or the floor for `plateau`. |
+| `--patience` | int | `30` | Epochs of no improvement (on `--monitor-metric`) before early stopping. Generous by default since the default `cosine` schedule is fixed-length and benefits from running to completion rather than being cut short. |
+| `--monitor-metric` | `loss`\|`binary_accuracy`\|`precision`\|`recall`\|`exact_match_accuracy` | `exact_match_accuracy` | Validation metric used for early-stopping and best-checkpoint selection. Independent of the scheduler. |
 | `--monitor-mode` | `min`\|`max` | `max` (`min` if monitoring `loss`) | Direction of "improvement" for `--monitor-metric`. |
 | `--grad-clip-norm` | float | `0.0` (disabled) | Gradient-clipping max-norm. |
 | `--loss-type` | `bce`\|`focal`\|`asl` | `asl` | Training/eval loss function — see below. |
 | `--label-smoothing` | float | `0.05` | Softens hard 0/1 targets toward 0.5 by this amount, training loss only (never metrics or val/test loss). |
+| `--mixup-alpha` | float | `0.2` | MixUp (Zhang et al., 2018) `Beta(alpha,alpha)` interpolation strength for images+labels during training (`0` disables). Blended images/labels are used for the loss only — the running training-accuracy diagnostic and all val/test metrics use the original, unmixed labels. |
 | `--focal-gamma` | float | `2.0` | Focusing exponent, only used when `--loss-type focal`. |
 | `--asl-gamma-neg` | float | `4.0` | Asymmetric Loss negative-class focusing exponent, only used when `--loss-type asl`. |
 | `--asl-gamma-pos` | float | `1.0` | Asymmetric Loss positive-class focusing exponent, only used when `--loss-type asl`. |
