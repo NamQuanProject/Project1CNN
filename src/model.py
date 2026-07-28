@@ -139,6 +139,7 @@ class ResNetCNN(nn.Module):
             (64, 64, False),
             (64, 128, True),
             (128, 128, False),
+            (128, 128, False),
         ]
         n = len(block_specs)
         drop_probs = [max_drop_path * i / (n - 1) for i in range(n)]
