@@ -42,30 +42,41 @@ directory.
 
 ## The model: `ResNetCNN`
 
-`src/model.py` defines one architecture, built from three small pieces:
+`src/model.py` defines one architecture, built from a few small pieces:
 
-- **`SqueezeExcite`** — Squeeze-and-Excitation channel attention (Hu et al., 2018): a
-  cheap gate that reweights each feature channel by how useful it is for the current
-  input (e.g. suppress channels mostly responding to a distractor digit).
+- **`CBAM`** — Convolutional Block Attention Module (Woo et al., ECCV 2018,
+  [arxiv.org/abs/1807.06521](https://arxiv.org/abs/1807.06521)), applying two
+  sub-modules in sequence:
+  - **`ChannelAttention`** — like Squeeze-Excitation, a gate that reweights each
+    feature channel by how useful it is for the current input, but pools with
+    *both* average **and** max (through a shared MLP) rather than average only —
+    the paper's ablations found this gives a "finer" channel descriptor.
+  - **`SpatialAttention`** — pools *across the channel axis* (avg and max) to get
+    two single-channel H×W maps, concatenates them, and runs a 7×7 conv + sigmoid
+    to produce a per-pixel gate. This is genuinely new information channel-only
+    attention (SE, or CBAM's own channel module) can't represent: *which pixel
+    locations* matter, not just which channels — directly relevant here since the
+    digits that matter occupy varying, specific regions among overlapping
+    distractors.
 - **`DropPath`** — stochastic depth (Huang et al., 2016): randomly drops the entire
   residual branch for some training samples, an ensembling-style regularizer.
-- **`ResidualBlock`** — `(Conv → BN → ReLU) × 2` with a skip connection, plus the two
-  pieces above applied to the residual branch before the skip-add.
+- **`ResidualBlock`** — `(Conv → BN → ReLU) × 2` with a skip connection, plus CBAM
+  and DropPath applied to the residual branch before the skip-add.
 
 **`ResNetCNN`** assembles these into (block topology matches a reference
 implementation — a classmate's `assignment1_cnn.py` — that reached ~80% exact-match
 accuracy on this dataset):
 
 - **Stem**: a single 3×3 conv+BN+ReLU, no downsampling (stays at 64×64).
-- **5 residual blocks**: res1 (32ch, stride 1) → res2 (64ch, stride 2) → res3 (64ch,
-  stride 1) → res4 (128ch, stride 2) → res5 (128ch, stride 1). Only 2 of the 5 blocks
-  downsample (64×64 → 32×32 → 16×16), keeping more spatial detail into the final
-  feature map than a "downsample every block" design (which would end at 8×8) — that
-  matters for separating several small, overlapping digits. The "same-resolution"
-  blocks (res1/res3/res5) add extra nonlinear depth per scale instead of immediately
-  discarding resolution.
+- **6 residual blocks**: res1 (32ch, stride 1) → res2 (64ch, stride 2) → res3 (64ch,
+  stride 1) → res4 (128ch, stride 2) → res5/res6 (128ch, stride 1). Only 2 of the 6
+  blocks downsample (64×64 → 32×32 → 16×16), keeping more spatial detail into the
+  final feature map than a "downsample every block" design (which would end at
+  8×8) — that matters for separating several small, overlapping digits. The
+  "same-resolution" blocks (res1/res3/res5/res6) add extra nonlinear depth per
+  scale instead of immediately discarding resolution.
 - Drop probability for stochastic depth increases with block depth (0 → 0.1 across
-  the 5 blocks, deeper blocks being more overfitting-prone).
+  the blocks, deeper blocks being more overfitting-prone).
 - **Head**: SpatialDropout (`nn.Dropout2d`, 0.15) → GlobalAveragePooling →
   Dropout(0.35) → `Linear(128, 10)`. No `Flatten`/`Dense(256)`: avoids a large dense
   classifier, historically the main source of overfitting for this dataset size
@@ -73,7 +84,12 @@ accuracy on this dataset):
 - Conv weights use explicit Kaiming-normal ("he_normal") init, matching the reference
   implementation and standard practice for ReLU networks (PyTorch's default conv init
   is a Kaiming *uniform* variant, less well suited to deep ReLU stacks).
-- **~688K total parameters.**
+- **~981K total parameters** — CBAM itself adds almost nothing (~2.3K params per
+  block: the channel-attention MLP is shared between its avg/max branches, so the
+  max-pool addition is free; the spatial-attention 7×7 conv is only 98 params). A
+  ResNet-50 backbone was also tried on this task and badly overfit at 23.5M
+  parameters for a ~50K-image dataset — this architecture is deliberately kept an
+  order of magnitude smaller than that.
 - Returns raw **logits**, not sigmoid probabilities — pair with one of the losses
   below, and apply `torch.sigmoid()` only at evaluation/inference time.
 
