@@ -253,7 +253,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Train the ResNet-style multi-label digit CNN (PyTorch).")
     parser.add_argument("--data-dir", default=DEFAULT_DATA_DIR)
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
-    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument(
         "--batch-size", type=int, default=None, help="Defaults to the recommended batch size (128)."
     )
@@ -522,7 +522,7 @@ def main():
     scheduler_type = resolve_hparam(args.scheduler, MODEL_NAME, "scheduler", "plateau")
     warmup_epochs = resolve_hparam(args.warmup_epochs, MODEL_NAME, "warmup_epochs", 0)
     grad_clip_norm = resolve_hparam(args.grad_clip_norm, MODEL_NAME, "grad_clip_norm", 0.0)
-    patience = resolve_hparam(args.patience, MODEL_NAME, "patience", 5)
+    patience = resolve_hparam(args.patience, MODEL_NAME, "patience", 10)
     # lr_patience/min_lr are for ReduceLROnPlateau specifically; fall back to
     # the early-stopping `patience` (old coupled behavior) if not specified.
     lr_patience = resolve_hparam(args.lr_patience, MODEL_NAME, "lr_patience", patience)
