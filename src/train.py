@@ -111,6 +111,27 @@ def smooth_labels(labels, label_smoothing):
     return labels * (1 - label_smoothing) + 0.5 * label_smoothing
 
 
+def mixup_batch(images, labels, alpha):
+    """MixUp (Zhang et al., 2018): blend two random training images and
+    linearly interpolate their multi-hot label vectors by the same factor.
+    nn.BCEWithLogitsLoss (and the ASL/focal losses here) handle the
+    resulting soft (non-0/1) targets natively. A no-op when alpha <= 0.
+
+    Note: after this, the *original* `labels` no longer describes the
+    (now-blended) `images` exactly -- train.py's running training-accuracy
+    diagnostic still compares against the original labels for simplicity,
+    so it reads a bit noisy/pessimistic while mixup is active. This doesn't
+    affect validation/test metrics, which never use mixup.
+    """
+    if alpha is None or alpha <= 0.0:
+        return images, labels
+    lam = float(np.random.beta(alpha, alpha))
+    perm = torch.randperm(images.size(0), device=images.device)
+    mixed_images = lam * images + (1 - lam) * images[perm]
+    mixed_labels = lam * labels + (1 - lam) * labels[perm]
+    return mixed_images, mixed_labels
+
+
 def asymmetric_loss_with_logits(logits, targets, gamma_neg=4.0, gamma_pos=1.0, clip=0.05, eps=1e-8):
     """Asymmetric Loss (ASL) for multi-label classification (Ben-Baruch,
     Ridnik, et al., ICCV 2021, "Asymmetric Loss For Multi-Label
@@ -274,9 +295,12 @@ def parse_args():
     )
     parser.add_argument(
         "--scheduler",
-        choices=["plateau", "cosine_warmup"],
+        choices=["plateau", "cosine_warmup", "cosine"],
         default=None,
-        help="Defaults to 'plateau'.",
+        help="LR schedule. 'plateau' = ReduceLROnPlateau on val loss. 'cosine_warmup' = "
+        "linear warmup then cosine decay, stepped every batch. 'cosine' = plain "
+        "CosineAnnealingLR (T_max=epochs, eta_min=--min-lr), stepped once per epoch, "
+        "no warmup. Defaults per-model.",
     )
     parser.add_argument(
         "--warmup-epochs",
@@ -319,6 +343,13 @@ def parse_args():
         type=float,
         default=None,
         help="Softens 0/1 BCE targets toward 0.5 by this amount (training loss only). Defaults to 0.05.",
+    )
+    parser.add_argument(
+        "--mixup-alpha",
+        type=float,
+        default=None,
+        help="MixUp Beta(alpha,alpha) interpolation strength for images+labels during "
+        "training (0 disables). Defaults per-model.",
     )
     parser.add_argument(
         "--loss-type",
@@ -452,6 +483,7 @@ def train_one_epoch(
     ema,
     step_scheduler,
     label_smoothing=0.0,
+    mixup_alpha=0.0,
 ):
     model.train()
     total_loss = 0.0
@@ -467,10 +499,12 @@ def train_one_epoch(
         if channels_last:
             images = images.to(memory_format=torch.channels_last)
 
+        mixed_images, mixed_labels = mixup_batch(images, labels, mixup_alpha)
+
         optimizer.zero_grad(set_to_none=True)
         with autocast_ctx:
-            logits = model(images)
-            loss = criterion(logits, smooth_labels(labels, label_smoothing))
+            logits = model(mixed_images)
+            loss = criterion(logits, smooth_labels(mixed_labels, label_smoothing))
 
         if scaler is not None:
             scaler.scale(loss).backward()
@@ -532,6 +566,7 @@ def main():
         None, MODEL_NAME, "monitor_mode", MONITOR_MODE_BY_METRIC.get(monitor_metric, "max")
     )
     label_smoothing = resolve_hparam(args.label_smoothing, MODEL_NAME, "label_smoothing", 0.0)
+    mixup_alpha = resolve_hparam(args.mixup_alpha, MODEL_NAME, "mixup_alpha", 0.0)
     loss_type = resolve_hparam(args.loss_type, MODEL_NAME, "loss_type", "bce")
     focal_gamma = resolve_hparam(args.focal_gamma, MODEL_NAME, "focal_gamma", 2.0)
     asl_gamma_neg = resolve_hparam(args.asl_gamma_neg, MODEL_NAME, "asl_gamma_neg", 4.0)
@@ -546,7 +581,7 @@ def main():
         f"weight_decay={weight_decay}, batch_size={batch_size}, scheduler={scheduler_type}, "
         f"warmup_epochs={warmup_epochs}, grad_clip_norm={grad_clip_norm}, patience={patience}, "
         f"lr_patience={lr_patience}, min_lr={min_lr}, monitor={monitor_metric} ({monitor_mode}), "
-        f"label_smoothing={label_smoothing}, loss_type={loss_type}"
+        f"label_smoothing={label_smoothing}, mixup_alpha={mixup_alpha}, loss_type={loss_type}"
         + (
             f" (asl_gamma_neg={asl_gamma_neg}, asl_gamma_pos={asl_gamma_pos}, asl_clip={asl_clip}, "
             f"asl_weight={asl_weight})"
@@ -646,6 +681,7 @@ def main():
 
     plateau_scheduler = None
     step_scheduler = None
+    epoch_scheduler = None
     if scheduler_type == "cosine_warmup":
         steps_per_epoch = max(1, len(train_loader))
         total_steps = args.epochs * steps_per_epoch
@@ -653,6 +689,14 @@ def main():
         step_scheduler = torch.optim.lr_scheduler.LambdaLR(
             optimizer,
             lr_lambda=functools.partial(cosine_warmup_lambda, warmup_steps=warmup_steps, total_steps=total_steps),
+        )
+    elif scheduler_type == "cosine":
+        # Plain cosine decay over the full run, no warmup, stepped once per
+        # epoch -- a fixed, well-behaved schedule for a training run of a
+        # known length (unlike ReduceLROnPlateau, doesn't depend on val_loss
+        # improving to make progress).
+        epoch_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=args.epochs, eta_min=min_lr
         )
     else:
         plateau_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -697,12 +741,15 @@ def main():
             ema,
             step_scheduler,
             label_smoothing,
+            mixup_alpha,
         )
 
         eval_model = ema.shadow if ema is not None else model
         val_metrics, _, _ = evaluate(eval_model, val_loader, criterion, device, amp_dtype, channels_last)
         if plateau_scheduler is not None:
             plateau_scheduler.step(val_metrics["loss"])
+        if epoch_scheduler is not None:
+            epoch_scheduler.step()
 
         history["loss"].append(train_loss)
         history["val_loss"].append(val_metrics["loss"])
@@ -817,6 +864,7 @@ def main():
             "monitor_metric": monitor_metric,
             "monitor_mode": monitor_mode,
             "label_smoothing": label_smoothing,
+            "mixup_alpha": mixup_alpha,
             "loss_type": loss_type,
             "focal_gamma": focal_gamma,
             "asl_gamma_neg": asl_gamma_neg,

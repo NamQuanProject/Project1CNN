@@ -5,94 +5,48 @@ The model returns raw logits (no sigmoid) -- pair with nn.BCEWithLogitsLoss
 torch.sigmoid() to the output at inference time.
 """
 
+import math
+
 import torch
 import torch.nn as nn
 
 
-class ChannelAttention(nn.Module):
-    """CBAM channel attention (Woo et al., ECCV 2018, "CBAM: Convolutional
-    Block Attention Module", arxiv.org/abs/1807.06521): like
-    Squeeze-Excitation, a global-context gate that reweights each channel by
-    how useful it is for the current input -- but pools with BOTH average
-    AND max (not just average like SE), feeding both descriptors through the
-    same shared MLP before summing. The paper's ablations found this
-    "finer" than SE's average-only channel descriptor: max-pool captures
-    which channels have a strong, spatially-localized activation somewhere
-    in the image (e.g. a channel that fires strongly on one specific digit's
-    stroke), which plain average-pooling dilutes away.
+class ECA(nn.Module):
+    """Efficient Channel Attention (Wang et al., CVPR 2020, "ECA-Net:
+    Efficient Channel Attention for Deep Convolutional Neural Networks",
+    arxiv.org/abs/1910.03151). Replaces both the earlier SE and CBAM
+    channel gates here: SE's channels -> hidden -> channels bottleneck
+    (dimensionality reduction) is, per the ECA paper's analysis, actually
+    harmful to channel-attention quality, not just a compute-saving
+    compromise. ECA instead runs a single lightweight 1D conv directly over
+    the pooled per-channel descriptor -- each channel's gate depends on its
+    k nearest channel neighbors (local cross-channel interaction) -- with
+    far fewer parameters than SE's two dense layers and no bottleneck.
 
-        Mc(F) = sigmoid(MLP(AvgPool(F)) + MLP(MaxPool(F)))
+    Kernel size k is adaptive to channel count (odd, via the paper's
+    formula k = |log2(C)/gamma + b/gamma|, gamma=2, b=1): e.g. k=3 for
+    64 channels, k=5 for 128/256.
+
+    (CBAM -- channel + spatial attention -- was also tried in this model
+    and empirically underperformed on this dataset/training budget; ECA is
+    simpler and cheaper than either SE or CBAM, and directly addresses the
+    SE bottleneck the CBAM swap was originally trying to improve on.)
     """
 
-    def __init__(self, channels, reduction=16):
+    def __init__(self, channels, gamma=2, b=1):
         super().__init__()
-        hidden = max(1, channels // reduction)
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.max_pool = nn.AdaptiveMaxPool2d(1)
-        self.mlp = nn.Sequential(
-            nn.Conv2d(channels, hidden, kernel_size=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(hidden, channels, kernel_size=1),
-        )
+        k = int(abs((math.log2(channels) / gamma) + (b / gamma)))
+        k = k if k % 2 else k + 1  # round to nearest odd kernel size
+        k = max(k, 3)
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.conv = nn.Conv1d(1, 1, kernel_size=k, padding=k // 2, bias=False)
 
     def forward(self, x):
-        avg_out = self.mlp(self.avg_pool(x))
-        max_out = self.mlp(self.max_pool(x))
-        scale = torch.sigmoid(avg_out + max_out)
-        return x * scale
-
-
-class SpatialAttention(nn.Module):
-    """CBAM spatial attention (Woo et al., ECCV 2018): pools *across the
-    channel axis* (not spatially) with both average and max, producing two
-    single-channel H x W maps that summarize "how active is this pixel
-    location, on average / at its most active channel". These are
-    concatenated and passed through a 7x7 conv + sigmoid to produce a
-    per-pixel gate. Channel attention answers "which feature channels
-    matter"; this answers "which pixel locations matter" -- complementary,
-    and specifically useful here since the digits that matter occupy
-    varying, specific regions of the 64x64 canvas among overlapping
-    distractors, information channel-only attention (SE, or CBAM's own
-    channel module) cannot represent.
-
-        Ms(F) = sigmoid(conv7x7([AvgPool_channel(F); MaxPool_channel(F)]))
-
-    Kernel size 7x7 is the paper's recommended default (their ablation found
-    it outperforms 3x3 -- a larger receptive field helps localize which
-    region the current feature map should attend to).
-    """
-
-    def __init__(self, kernel_size=7):
-        super().__init__()
-        self.conv = nn.Conv2d(2, 1, kernel_size=kernel_size, padding=kernel_size // 2, bias=False)
-
-    def forward(self, x):
-        avg_out = torch.mean(x, dim=1, keepdim=True)
-        max_out, _ = torch.max(x, dim=1, keepdim=True)
-        scale = torch.sigmoid(self.conv(torch.cat([avg_out, max_out], dim=1)))
-        return x * scale
-
-
-class CBAM(nn.Module):
-    """Convolutional Block Attention Module (Woo et al., ECCV 2018,
-    arxiv.org/abs/1807.06521): sequentially applies channel attention (see
-    `ChannelAttention`) then spatial attention (see `SpatialAttention`) --
-    the paper found sequential channel-then-spatial to outperform parallel
-    or spatial-then-channel arrangements.
-
-        F'  = Mc(F) (x) F
-        F'' = Ms(F') (x) F'
-    """
-
-    def __init__(self, channels, reduction=16, spatial_kernel_size=7):
-        super().__init__()
-        self.channel_attention = ChannelAttention(channels, reduction=reduction)
-        self.spatial_attention = SpatialAttention(kernel_size=spatial_kernel_size)
-
-    def forward(self, x):
-        x = self.channel_attention(x)
-        x = self.spatial_attention(x)
-        return x
+        y = self.pool(x)  # [B, C, 1, 1]
+        y = y.squeeze(-1).transpose(-1, -2)  # [B, 1, C]
+        y = self.conv(y)  # [B, 1, C]
+        y = y.transpose(-1, -2).unsqueeze(-1)  # [B, C, 1, 1]
+        return x * torch.sigmoid(y)
 
 
 class DropPath(nn.Module):
@@ -117,26 +71,27 @@ class DropPath(nn.Module):
 
 
 class ResidualBlock(nn.Module):
-    """Residual block: (Conv -> BN -> ReLU) x2, optional CBAM (channel +
-    spatial attention, see `CBAM`) on the residual branch, optional
-    stochastic depth (DropPath), then a skip connection.
+    """Residual block: (Conv -> BN -> SiLU) x2, optional ECA channel
+    attention on the residual branch, optional stochastic depth (DropPath),
+    then a skip connection.
 
     Downsamples by stride 2 in the first conv when `downsample=True`; the
     shortcut path uses a matching 1x1 stride-2 conv + BN so it can be added
-    to the main path.
+    to the main path. Uses SiLU (x * sigmoid(x)) instead of ReLU: smooth and
+    non-zero everywhere (no "dead unit" gradient collapse the way ReLU can
+    have), which several modern CNN designs (EfficientNet and others) found
+    to outperform ReLU slightly at negligible extra cost.
     """
 
-    def __init__(
-        self, in_channels, out_channels, downsample=False, use_cbam=True, cbam_reduction=16, drop_path=0.0
-    ):
+    def __init__(self, in_channels, out_channels, downsample=False, use_eca=True, drop_path=0.0):
         super().__init__()
         stride = 2 if downsample else 1
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(out_channels)
         self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(out_channels)
-        self.relu = nn.ReLU(inplace=True)
-        self.cbam = CBAM(out_channels, reduction=cbam_reduction) if use_cbam else nn.Identity()
+        self.act = nn.SiLU(inplace=True)
+        self.eca = ECA(out_channels) if use_eca else nn.Identity()
         self.drop_path = DropPath(drop_path)
 
         self.shortcut = None
@@ -148,75 +103,79 @@ class ResidualBlock(nn.Module):
 
     def forward(self, x):
         identity = self.shortcut(x) if self.shortcut is not None else x
-        out = self.relu(self.bn1(self.conv1(x)))
+        out = self.act(self.bn1(self.conv1(x)))
         out = self.bn2(self.conv2(out))
-        out = self.cbam(out)
+        out = self.eca(out)
         out = self.drop_path(out)
-        return self.relu(out + identity)
+        return self.act(out + identity)
 
 
 class ResNetCNN(nn.Module):
     """Residual CNN for multi-label digit classification.
 
-    Block topology matches a reference implementation (a classmate's
-    `assignment1_cnn.py`) that reached ~80% exact-match accuracy on this
-    dataset, plus further strengthening techniques layered on top (CBAM
-    channel+spatial attention, stochastic depth):
+    Upgraded recipe (widened/deepened vs. the earlier 6-block/32-64-128
+    version, plus a channel-attention swap and a smoother activation):
 
-    - Stem: a single 3x3 conv+BN+ReLU, no downsampling (stays at 64x64).
-    - 6 residual blocks: res1 (32ch, stride 1) -> res2 (64ch, stride 2) ->
-      res3 (64ch, stride 1) -> res4 (128ch, stride 2) -> res5/res6 (128ch,
-      stride 1). Only 2 of the 6 blocks downsample (64x64 -> 32x32 ->
-      16x16) -- keeping more spatial detail into the final feature map than
-      a "downsample every block" design (which would end at 8x8). That
-      matters for separating several small, overlapping digits. The
-      "same-resolution" blocks (res1/res3/res5/res6) add extra nonlinear
-      depth at each scale instead of immediately discarding resolution.
-    - Each residual block includes a CBAM gate (see `CBAM`: channel
-      attention -- "which feature channels matter" -- followed by spatial
-      attention -- "which pixel locations matter", the latter something a
-      channel-only gate like plain Squeeze-Excitation cannot represent, and
-      directly relevant here since the digits that matter occupy varying,
-      specific regions among overlapping distractors) and stochastic depth
-      (see `DropPath`), with drop probability increasing with depth (0 ->
-      `max_drop_path` across the blocks, deeper blocks being more
-      overfitting-prone) -- regularization to offset the extra capacity
-      from the added blocks/CBAM gates.
+    - Stem: a single 3x3 conv+BN+SiLU, no downsampling (stays at 64x64),
+      now outputting 64 channels (was 32).
+    - 12 residual blocks in 3 stages of 4, channels 64 -> 128 -> 256, only
+      the first block of stage 2 and stage 3 downsamples (64x64 -> 32x32 ->
+      16x16) -- same "don't over-downsample" philosophy as before (a
+      "downsample every block" design would end at a much smaller map,
+      hurting separation of several small, overlapping digits), just with
+      more blocks per stage and more channels per stage. The 3
+      same-resolution blocks per stage add nonlinear depth before handing
+      off to the next (downsampling + channel-widening) stage.
+    - Each residual block includes an ECA channel-attention gate (see
+      `ECA`) and stochastic depth (see `DropPath`), with drop probability
+      increasing with block depth (0 -> `max_drop_path` across the 12
+      blocks) -- regularization to offset the substantially larger capacity
+      of this configuration vs. the earlier one.
     - Head: SpatialDropout (nn.Dropout2d, 0.15) -> GlobalAveragePooling ->
-      Dropout(0.35) -> Linear(10). No Flatten/Dense(256): avoids a large
-      dense classifier, historically the main source of overfitting for
-      this dataset size (~50K training images).
-    - Conv weights use explicit Kaiming-normal ("he_normal") init, matching
-      the reference implementation and standard practice for ReLU networks
-      (PyTorch's default conv init is a Kaiming *uniform* variant that isn't
-      as well suited to deep ReLU stacks).
-    - Pair with AdamW(lr=3e-4, weight_decay=1e-4) and augmentation that
-      avoids rotation/flip (translate + zoom + contrast only), since
-      rotating/flipping digits can turn a 6 into a 9 or vice versa.
+      Dropout(0.35) -> Linear(256, 10). No Flatten/Dense(256-unit-MLP):
+      avoids a large dense classifier, historically the main source of
+      overfitting for this dataset size (~50K training images).
+    - Conv weights use explicit Kaiming-normal ("he_normal") init
+      (`nonlinearity="relu"` is used for the gain calculation since PyTorch
+      has no dedicated SiLU entry; relu's gain is the standard stand-in for
+      SiLU/Swish in practice, since both behave near-linearly for positive
+      inputs).
+    - Pair with AdamW, a cosine-annealed LR schedule (`--scheduler cosine`),
+      MixUp (`--mixup-alpha`), and augmentation that avoids rotation/flip
+      (translate + zoom + contrast only), since rotating/flipping digits
+      can turn a 6 into a 9 or vice versa.
     """
 
-    def __init__(self, in_channels=1, num_classes=10, use_cbam=True, max_drop_path=0.1):
+    def __init__(self, in_channels=1, num_classes=10, use_eca=True, max_drop_path=0.1):
         super().__init__()
         self.stem = nn.Sequential(
-            nn.Conv2d(in_channels, 32, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(32),
-            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels, 64, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.SiLU(inplace=True),
         )
 
-        # (in_channels, out_channels, downsample)
+        # (in_channels, out_channels, downsample) -- 3 stages of 4 blocks,
+        # channels 64 -> 128 -> 256, downsampling only at each stage's
+        # first block.
         block_specs = [
-            (32, 32, False),
-            (32, 64, True),
+            (64, 64, False),
+            (64, 64, False),
+            (64, 64, False),
             (64, 64, False),
             (64, 128, True),
             (128, 128, False),
             (128, 128, False),
+            (128, 128, False),
+            (128, 256, True),
+            (256, 256, False),
+            (256, 256, False),
+            (256, 256, False),
         ]
         n = len(block_specs)
         drop_probs = [max_drop_path * i / (n - 1) for i in range(n)]
         self.blocks = nn.ModuleList(
             [
-                ResidualBlock(cin, cout, downsample=down, use_cbam=use_cbam, drop_path=dp)
+                ResidualBlock(cin, cout, downsample=down, use_eca=use_eca, drop_path=dp)
                 for (cin, cout, down), dp in zip(block_specs, drop_probs)
             ]
         )
@@ -224,7 +183,7 @@ class ResNetCNN(nn.Module):
         self.spatial_dropout = nn.Dropout2d(0.15)
         self.pool = nn.AdaptiveAvgPool2d(1)
         self.dropout = nn.Dropout(0.35)
-        self.fc = nn.Linear(128, num_classes)
+        self.fc = nn.Linear(256, num_classes)
 
         self.apply(self._init_weights)
 
@@ -293,22 +252,30 @@ MODEL_HPARAM_DEFAULTS = {
         "lr": 3e-4,
         "optimizer": "adamw",
         "weight_decay": 1e-4,
-        # Matches the reference recipe (assignment1_cnn.py, ~80% exact-match):
-        # LR plateau-reduction is patient (3 epochs) and reaches a lower floor
-        # than early-stopping patience (10 epochs) -- the two are deliberately
-        # decoupled, see --lr-patience / --min-lr / --patience in train.py.
-        "lr_patience": 3,
+        # Plain cosine annealing (torch.optim.lr_scheduler.CosineAnnealingLR,
+        # T_max=epochs, eta_min=min_lr) instead of ReduceLROnPlateau: a
+        # fixed, well-behaved decay for a training run of a known length.
+        "scheduler": "cosine",
         "min_lr": 1e-6,
-        "patience": 10,
+        # Because a fixed cosine schedule assumes running to completion,
+        # early-stopping patience is generous (vs. the smaller model's 10)
+        # so it doesn't cut the anneal short; this is also now a bigger
+        # model (12 blocks, 64->128->256ch) that may need more epochs.
+        "patience": 30,
         # Early-stopping / checkpoint-selection watches exact-match accuracy
         # directly (mode "max") instead of val_loss -- that's the metric that
         # actually matters for this task, and can improve even while val_loss
         # is flat or slightly rising.
         "monitor_metric": "exact_match_accuracy",
-        # Extra strengthening beyond the reference recipe:
+        # Extra strengthening:
         "ema": True,
         "ema_decay": 0.9995,
         "label_smoothing": 0.05,
+        # MixUp (Zhang et al., 2018): blends pairs of training images and
+        # linearly interpolates their multi-hot labels by the same factor.
+        # 0.2 is the standard value from the paper; regularizes the larger
+        # capacity of this configuration.
+        "mixup_alpha": 0.2,
         # Asymmetric Loss (Ben-Baruch/Ridnik et al., ICCV 2021) instead of
         # plain BCE: handles the positive/negative imbalance in this task
         # (~6-8 of 10 digit slots present per image, so negatives outnumber
