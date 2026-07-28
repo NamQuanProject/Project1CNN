@@ -57,10 +57,7 @@ def main():
     channels_last = device.type == "cuda"
 
     checkpoint = torch.load(args.model_path, map_location=device)
-    # Always pretrained=False: we're about to overwrite the weights with the
-    # checkpoint's trained state_dict, so downloading ImageNet weights first
-    # would be wasted work (and fail on offline eval machines).
-    model = build_model(checkpoint["model_name"], pretrained=False).to(device)
+    model = build_model(checkpoint["model_name"]).to(device)
 
     ema_state = checkpoint.get("ema_state_dict")
     if args.use_ema and ema_state is not None:

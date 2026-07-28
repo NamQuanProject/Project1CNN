@@ -97,9 +97,7 @@ def main():
     os.makedirs(output_dir, exist_ok=True)
 
     checkpoint = torch.load(args.model_path, map_location=device)
-    # Always pretrained=False: about to overwrite weights with the checkpoint's
-    # trained state_dict, so downloading ImageNet weights would be wasted work.
-    model = build_model(checkpoint["model_name"], pretrained=False).to(device)
+    model = build_model(checkpoint["model_name"]).to(device)
 
     ema_state = checkpoint.get("ema_state_dict")
     if args.use_ema and ema_state is not None:

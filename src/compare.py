@@ -1,9 +1,12 @@
-"""Compare test_metrics.json from two training runs (e.g. baseline vs improved).
+"""Compare test_metrics.json from two training runs (e.g. before/after a
+change to hyperparameters or architecture). --baseline/--improved are just
+labels for "before" and "after" -- both should point at a resnet run's
+test_metrics.json.
 
 Usage:
-    python cnn/src/compare.py \
-        --baseline cnn/outputs/baseline_.../test_metrics.json \
-        --improved cnn/outputs/improved_.../test_metrics.json
+    python src/compare.py \
+        --baseline outputs/resnet_v1/test_metrics.json \
+        --improved outputs/resnet_v2/test_metrics.json
 """
 
 import argparse

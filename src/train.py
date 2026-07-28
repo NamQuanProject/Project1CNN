@@ -1,12 +1,12 @@
-"""Train the multi-label digit CNN using PyTorch, with an optimized recipe
-available for the resnet50 model: mixed precision (bf16/fp16 autocast),
-channels-last memory format, torch.compile, differential learning rates
-(pretrained backbone vs. new head), no weight decay on norm/bias params,
-cosine LR schedule with warmup, gradient clipping, and EMA of weights.
+"""Train the ResNet-style multi-label digit CNN (src/model.py:ResNetCNN)
+using PyTorch: mixed precision (bf16/fp16 autocast), channels-last memory
+format, torch.compile, no weight decay on norm/bias params, a choice of LR
+schedules, several loss functions (BCE / focal / Asymmetric Loss), gradient
+clipping, and EMA of weights.
 
 Usage (from repo root or from src/, either works):
-    python src/train.py --model baseline
-    python src/train.py --model resnet50 --augment --run-name resnet50_v1
+    python src/train.py --augment
+    python src/train.py --augment --run-name resnet_v1
 """
 
 import argparse
@@ -41,7 +41,9 @@ from src.metrics import (
     per_position_accuracy,
     precision_recall,
 )
-from src.model import MODEL_BUILDERS, MODEL_HPARAM_DEFAULTS, build_model, build_param_groups
+from src.model import MODEL_HPARAM_DEFAULTS, build_model, build_param_groups
+
+MODEL_NAME = "resnet"
 
 DEFAULT_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data")
 DEFAULT_OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "outputs")
@@ -64,24 +66,16 @@ def get_device(preference="auto"):
     return torch.device("cpu")
 
 
-def build_augmentation(model_name):
-    """Light training-time augmentation. No rotation/flip for "resnet",
-    "resnet50", or "unet": that can turn a 6 into a 9 (or vice versa) and
-    corrupt the label.
+def build_augmentation():
+    """Light training-time augmentation. No rotation/flip: that can turn a
+    6 into a 9 (or vice versa) and corrupt the label.
     """
-    if model_name in ("resnet", "resnet50", "unet"):
-        return transforms.Compose(
-            [
-                # Keras RandomTranslation(0.04, 0.04) / RandomZoom(-0.08, 0.08).
-                transforms.RandomAffine(degrees=0, translate=(0.04, 0.04), scale=(0.92, 1.08)),
-                # Keras RandomContrast(0.12).
-                transforms.ColorJitter(contrast=0.12),
-            ]
-        )
     return transforms.Compose(
         [
-            transforms.RandomRotation(degrees=10),
-            transforms.RandomAffine(degrees=0, translate=(0.05, 0.05), scale=(0.95, 1.05)),
+            # Keras RandomTranslation(0.04, 0.04) / RandomZoom(-0.08, 0.08).
+            transforms.RandomAffine(degrees=0, translate=(0.04, 0.04), scale=(0.92, 1.08)),
+            # Keras RandomContrast(0.12).
+            transforms.ColorJitter(contrast=0.12),
         ]
     )
 
@@ -162,6 +156,18 @@ def asymmetric_loss_with_logits(logits, targets, gamma_neg=4.0, gamma_pos=1.0, c
     return -loss.mean()
 
 
+def focal_loss_with_logits(logits, targets, gamma):
+    """Focal loss (Lin et al., 2017), binary/multi-label form: down-weights
+    already-confident (easy) predictions and up-weights uncertain (hard)
+    ones relative to plain BCE.
+    """
+    bce = nn.functional.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+    p = torch.sigmoid(logits)
+    p_t = p * targets + (1 - p) * (1 - targets)
+    focal_weight = (1 - p_t).clamp(min=0.0) ** gamma
+    return (focal_weight * bce).mean()
+
+
 def build_criterion(loss_type, focal_gamma=0.0, asl_gamma_neg=4.0, asl_gamma_pos=1.0, asl_clip=0.05, asl_weight=1.0):
     """Build the training/eval loss function selected by --loss-type.
 
@@ -184,18 +190,6 @@ def build_criterion(loss_type, focal_gamma=0.0, asl_gamma_neg=4.0, asl_gamma_pos
     if loss_type == "focal" and focal_gamma and focal_gamma > 0:
         return functools.partial(focal_loss_with_logits, gamma=focal_gamma)
     return nn.BCEWithLogitsLoss()
-
-
-def focal_loss_with_logits(logits, targets, gamma):
-    """Focal loss (Lin et al., 2017), binary/multi-label form: down-weights
-    already-confident (easy) predictions and up-weights uncertain (hard)
-    ones relative to plain BCE.
-    """
-    bce = nn.functional.binary_cross_entropy_with_logits(logits, targets, reduction="none")
-    p = torch.sigmoid(logits)
-    p_t = p * targets + (1 - p) * (1 - targets)
-    focal_weight = (1 - p_t).clamp(min=0.0) ** gamma
-    return (focal_weight * bce).mean()
 
 
 def resolve_amp_dtype(device, amp_mode):
@@ -256,71 +250,63 @@ def cosine_warmup_lambda(step, warmup_steps, total_steps):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train the multi-label digit CNN (PyTorch).")
+    parser = argparse.ArgumentParser(description="Train the ResNet-style multi-label digit CNN (PyTorch).")
     parser.add_argument("--data-dir", default=DEFAULT_DATA_DIR)
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
-    parser.add_argument("--model", choices=sorted(MODEL_BUILDERS), default="baseline")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument(
-        "--batch-size", type=int, default=None, help="Defaults to the model's recommended batch size."
+        "--batch-size", type=int, default=None, help="Defaults to the recommended batch size (128)."
     )
     parser.add_argument(
-        "--lr", type=float, default=None, help="Defaults to the model's recommended lr (see MODEL_HPARAM_DEFAULTS)."
-    )
-    parser.add_argument(
-        "--backbone-lr",
-        type=float,
-        default=None,
-        help="LR for pretrained backbone layers (resnet50 only). Defaults to the model's recommendation.",
+        "--lr", type=float, default=None, help="Defaults to the recommended lr (see MODEL_HPARAM_DEFAULTS)."
     )
     parser.add_argument(
         "--optimizer",
         choices=["adam", "adamw"],
         default=None,
-        help="Defaults to the model's recommended optimizer.",
+        help="Defaults to the recommended optimizer (adamw).",
     )
     parser.add_argument(
         "--weight-decay",
         type=float,
         default=None,
-        help="Defaults to the model's recommended weight decay. Never applied to norm/bias params.",
+        help="Defaults to the recommended weight decay. Never applied to norm/bias params.",
     )
     parser.add_argument(
         "--scheduler",
         choices=["plateau", "cosine_warmup"],
         default=None,
-        help="Defaults to the model's recommendation ('plateau' for most models, "
-        "'cosine_warmup' for resnet50).",
+        help="Defaults to 'plateau'.",
     )
     parser.add_argument(
         "--warmup-epochs",
         type=int,
         default=None,
-        help="Linear warmup length for the cosine_warmup scheduler. Defaults to the model's recommendation.",
+        help="Linear warmup length for the cosine_warmup scheduler. Defaults to 0.",
     )
     parser.add_argument(
         "--grad-clip-norm",
         type=float,
         default=None,
-        help="Gradient clipping max-norm (0 disables). Defaults to the model's recommendation.",
+        help="Gradient clipping max-norm (0 disables). Defaults to 0 (disabled).",
     )
     parser.add_argument("--patience", type=int, default=None, help="Early-stopping patience in epochs.")
     parser.add_argument(
         "--lr-patience",
         type=int,
         default=None,
-        help="Patience (epochs) for the 'plateau' scheduler's LR reduction. Defaults to the model's "
-        "recommendation, or --patience if the model doesn't specify one (the old coupled behavior).",
+        help="Patience (epochs) for the 'plateau' scheduler's LR reduction. Defaults to the "
+        "recommended value, or --patience if not set (the old coupled behavior).",
     )
     parser.add_argument(
-        "--min-lr", type=float, default=None, help="Floor LR for the 'plateau' scheduler. Defaults per-model."
+        "--min-lr", type=float, default=None, help="Floor LR for the 'plateau' scheduler. Defaults to 1e-6."
     )
     parser.add_argument(
         "--monitor-metric",
         choices=["loss", "binary_accuracy", "precision", "recall", "exact_match_accuracy"],
         default=None,
-        help="Validation metric used for early-stopping and best-checkpoint selection. Defaults to "
-        "the model's recommendation, or 'loss' otherwise.",
+        help="Validation metric used for early-stopping and best-checkpoint selection. Defaults "
+        "to exact_match_accuracy.",
     )
     parser.add_argument(
         "--monitor-mode",
@@ -332,47 +318,47 @@ def parse_args():
         "--label-smoothing",
         type=float,
         default=None,
-        help="Softens 0/1 BCE targets toward 0.5 by this amount (training loss only). Defaults per-model.",
+        help="Softens 0/1 BCE targets toward 0.5 by this amount (training loss only). Defaults to 0.05.",
     )
     parser.add_argument(
         "--loss-type",
         choices=["bce", "focal", "asl"],
         default=None,
-        help="Training/eval loss function. Defaults to the model's recommendation, or 'bce' otherwise.",
+        help="Training/eval loss function. Defaults to 'asl'.",
     )
     parser.add_argument(
         "--focal-gamma",
         type=float,
         default=None,
-        help="Focusing exponent, only used when --loss-type focal. Defaults per-model. Try 2.0.",
+        help="Focusing exponent, only used when --loss-type focal. Defaults to 2.0.",
     )
     parser.add_argument(
         "--asl-gamma-neg",
         type=float,
         default=None,
         help="Asymmetric Loss negative-class focusing exponent, only used when --loss-type asl. "
-        "Defaults per-model, else 4.0 (the paper's recommendation).",
+        "Defaults to 4.0 (the paper's recommendation).",
     )
     parser.add_argument(
         "--asl-gamma-pos",
         type=float,
         default=None,
         help="Asymmetric Loss positive-class focusing exponent, only used when --loss-type asl. "
-        "Defaults per-model, else 1.0 (the paper's recommendation).",
+        "Defaults to 1.0 (the paper's recommendation).",
     )
     parser.add_argument(
         "--asl-clip",
         type=float,
         default=None,
         help="Asymmetric Loss probability-shifting margin for easy negatives, only used when "
-        "--loss-type asl. Defaults per-model, else 0.05 (the paper's recommendation).",
+        "--loss-type asl. Defaults to 0.05 (the paper's recommendation).",
     )
     parser.add_argument(
         "--asl-weight",
         type=float,
         default=None,
         help="Blends ASL with plain BCE: asl_weight*ASL + (1-asl_weight)*BCE, only used when "
-        "--loss-type asl. Defaults per-model, else 1.0 (pure ASL).",
+        "--loss-type asl. Defaults to 1.0 (pure ASL).",
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
@@ -395,32 +381,22 @@ def parse_args():
         help="torch.compile the model. 'auto' enables it whenever the device is CUDA.",
     )
 
-    pretrained_group = parser.add_mutually_exclusive_group()
-    pretrained_group.add_argument("--pretrained", dest="pretrained", action="store_true", default=None)
-    pretrained_group.add_argument(
-        "--no-pretrained",
-        dest="pretrained",
-        action="store_false",
-        help="resnet50 only: skip loading ImageNet-pretrained backbone weights.",
-    )
-
     ema_group = parser.add_mutually_exclusive_group()
     ema_group.add_argument("--ema", dest="ema", action="store_true", default=None)
     ema_group.add_argument("--no-ema", dest="ema", action="store_false", help="Disable EMA of model weights.")
     parser.add_argument(
-        "--ema-decay", type=float, default=None, help="Defaults to the model's recommended EMA decay."
+        "--ema-decay", type=float, default=None, help="Defaults to the recommended EMA decay (0.9995)."
     )
 
     parser.add_argument(
         "--augment",
         action="store_true",
-        help="Apply light augmentation to training data (rotation+translate+scale, "
-        "or for --model resnet/resnet50/unet: translate+zoom+contrast only, no rotation/flip).",
+        help="Apply light augmentation to training data (translate+zoom+contrast, no rotation/flip).",
     )
     parser.add_argument(
         "--run-name",
         default=None,
-        help="Subfolder name under output-dir. Defaults to <model>_<timestamp>.",
+        help="Subfolder name under output-dir. Defaults to resnet_<timestamp>.",
     )
     return parser.parse_args()
 
@@ -535,41 +511,38 @@ def main():
         torch.backends.cudnn.benchmark = True
         torch.set_float32_matmul_precision("high")
 
-    run_name = args.run_name or f"{args.model}_{time.strftime('%Y%m%d_%H%M%S')}"
+    run_name = args.run_name or f"{MODEL_NAME}_{time.strftime('%Y%m%d_%H%M%S')}"
     run_dir = os.path.join(args.output_dir, run_name)
     os.makedirs(run_dir, exist_ok=True)
 
-    lr = resolve_hparam(args.lr, args.model, "lr", 1e-3)
-    backbone_lr = resolve_hparam(args.backbone_lr, args.model, "backbone_lr", lr)
-    optimizer_name = resolve_hparam(args.optimizer, args.model, "optimizer", "adam")
-    weight_decay = resolve_hparam(args.weight_decay, args.model, "weight_decay", 0.0)
-    batch_size = resolve_hparam(args.batch_size, args.model, "batch_size", 128)
-    scheduler_type = resolve_hparam(args.scheduler, args.model, "scheduler", "plateau")
-    warmup_epochs = resolve_hparam(args.warmup_epochs, args.model, "warmup_epochs", 0)
-    grad_clip_norm = resolve_hparam(args.grad_clip_norm, args.model, "grad_clip_norm", 0.0)
-    patience = resolve_hparam(args.patience, args.model, "patience", 5)
+    lr = resolve_hparam(args.lr, MODEL_NAME, "lr", 1e-3)
+    optimizer_name = resolve_hparam(args.optimizer, MODEL_NAME, "optimizer", "adam")
+    weight_decay = resolve_hparam(args.weight_decay, MODEL_NAME, "weight_decay", 0.0)
+    batch_size = resolve_hparam(args.batch_size, MODEL_NAME, "batch_size", 128)
+    scheduler_type = resolve_hparam(args.scheduler, MODEL_NAME, "scheduler", "plateau")
+    warmup_epochs = resolve_hparam(args.warmup_epochs, MODEL_NAME, "warmup_epochs", 0)
+    grad_clip_norm = resolve_hparam(args.grad_clip_norm, MODEL_NAME, "grad_clip_norm", 0.0)
+    patience = resolve_hparam(args.patience, MODEL_NAME, "patience", 5)
     # lr_patience/min_lr are for ReduceLROnPlateau specifically; fall back to
-    # the early-stopping `patience` (old coupled behavior) if a model doesn't
-    # give its own recommendation.
-    lr_patience = resolve_hparam(args.lr_patience, args.model, "lr_patience", patience)
-    min_lr = resolve_hparam(args.min_lr, args.model, "min_lr", 1e-5)
-    monitor_metric = resolve_hparam(args.monitor_metric, args.model, "monitor_metric", "loss")
+    # the early-stopping `patience` (old coupled behavior) if not specified.
+    lr_patience = resolve_hparam(args.lr_patience, MODEL_NAME, "lr_patience", patience)
+    min_lr = resolve_hparam(args.min_lr, MODEL_NAME, "min_lr", 1e-5)
+    monitor_metric = resolve_hparam(args.monitor_metric, MODEL_NAME, "monitor_metric", "loss")
     monitor_mode = args.monitor_mode or resolve_hparam(
-        None, args.model, "monitor_mode", MONITOR_MODE_BY_METRIC.get(monitor_metric, "max")
+        None, MODEL_NAME, "monitor_mode", MONITOR_MODE_BY_METRIC.get(monitor_metric, "max")
     )
-    label_smoothing = resolve_hparam(args.label_smoothing, args.model, "label_smoothing", 0.0)
-    loss_type = resolve_hparam(args.loss_type, args.model, "loss_type", "bce")
-    focal_gamma = resolve_hparam(args.focal_gamma, args.model, "focal_gamma", 2.0)
-    asl_gamma_neg = resolve_hparam(args.asl_gamma_neg, args.model, "asl_gamma_neg", 4.0)
-    asl_gamma_pos = resolve_hparam(args.asl_gamma_pos, args.model, "asl_gamma_pos", 1.0)
-    asl_clip = resolve_hparam(args.asl_clip, args.model, "asl_clip", 0.05)
-    asl_weight = resolve_hparam(args.asl_weight, args.model, "asl_weight", 1.0)
-    pretrained = resolve_hparam(args.pretrained, args.model, "pretrained", False)
-    ema_enabled = resolve_hparam(args.ema, args.model, "ema", False)
-    ema_decay = resolve_hparam(args.ema_decay, args.model, "ema_decay", 0.999)
+    label_smoothing = resolve_hparam(args.label_smoothing, MODEL_NAME, "label_smoothing", 0.0)
+    loss_type = resolve_hparam(args.loss_type, MODEL_NAME, "loss_type", "bce")
+    focal_gamma = resolve_hparam(args.focal_gamma, MODEL_NAME, "focal_gamma", 2.0)
+    asl_gamma_neg = resolve_hparam(args.asl_gamma_neg, MODEL_NAME, "asl_gamma_neg", 4.0)
+    asl_gamma_pos = resolve_hparam(args.asl_gamma_pos, MODEL_NAME, "asl_gamma_pos", 1.0)
+    asl_clip = resolve_hparam(args.asl_clip, MODEL_NAME, "asl_clip", 0.05)
+    asl_weight = resolve_hparam(args.asl_weight, MODEL_NAME, "asl_weight", 1.0)
+    ema_enabled = resolve_hparam(args.ema, MODEL_NAME, "ema", False)
+    ema_decay = resolve_hparam(args.ema_decay, MODEL_NAME, "ema_decay", 0.999)
 
     print(
-        f"Hyperparameters: lr={lr}, backbone_lr={backbone_lr}, optimizer={optimizer_name}, "
+        f"Hyperparameters: lr={lr}, optimizer={optimizer_name}, "
         f"weight_decay={weight_decay}, batch_size={batch_size}, scheduler={scheduler_type}, "
         f"warmup_epochs={warmup_epochs}, grad_clip_norm={grad_clip_norm}, patience={patience}, "
         f"lr_patience={lr_patience}, min_lr={min_lr}, monitor={monitor_metric} ({monitor_mode}), "
@@ -582,7 +555,7 @@ def main():
             if loss_type == "focal"
             else ""
         )
-        + f", pretrained={pretrained}, ema={ema_enabled} (decay={ema_decay})"
+        + f", ema={ema_enabled} (decay={ema_decay})"
     )
 
     amp_dtype = resolve_amp_dtype(device, args.amp)
@@ -599,7 +572,7 @@ def main():
     pin_memory = device.type == "cuda"
 
     print(f"Loading data from {args.data_dir} ...")
-    transform_train = build_augmentation(args.model) if args.augment else None
+    transform_train = build_augmentation() if args.augment else None
     splits = load_splits(args.data_dir, transform_train=transform_train)
     train_ds, val_ds, test_ds = splits["train"], splits["val"], splits["test"]
     print("Train:", len(train_ds))
@@ -636,7 +609,7 @@ def main():
         persistent_workers=num_workers > 0,
     )
 
-    raw_model = build_model(args.model, pretrained=pretrained).to(device)
+    raw_model = build_model(MODEL_NAME).to(device)
     if channels_last:
         raw_model = raw_model.to(memory_format=torch.channels_last)
 
@@ -666,12 +639,7 @@ def main():
         asl_weight=asl_weight,
     )
     optimizer_cls = torch.optim.AdamW if optimizer_name == "adamw" else torch.optim.Adam
-    param_groups = build_param_groups(
-        raw_model,
-        lr=lr,
-        weight_decay=weight_decay,
-        backbone_lr=backbone_lr if hasattr(raw_model, "head_and_backbone_named_parameters") else None,
-    )
+    param_groups = build_param_groups(raw_model, lr=lr, weight_decay=weight_decay)
     optimizer = optimizer_cls(param_groups, lr=lr)
 
     scaler = torch.amp.GradScaler("cuda", enabled=(amp_dtype == torch.float16)) if device.type == "cuda" else None
@@ -764,10 +732,9 @@ def main():
             epochs_without_improvement = 0
             torch.save(
                 {
-                    "model_name": args.model,
+                    "model_name": MODEL_NAME,
                     "state_dict": best_state,
                     "ema_state_dict": best_ema_state,
-                    "pretrained": pretrained,
                 },
                 os.path.join(run_dir, "best_model.pt"),
             )
@@ -813,10 +780,9 @@ def main():
     )
     torch.save(
         {
-            "model_name": args.model,
+            "model_name": MODEL_NAME,
             "state_dict": raw_model.state_dict(),
             "ema_state_dict": final_ema_state,
-            "pretrained": pretrained,
         },
         os.path.join(run_dir, "final_model.pt"),
     )
@@ -834,12 +800,11 @@ def main():
         print(f"  digit {digit}: {acc:.4f}")
 
     summary = {
-        "model": args.model,
+        "model": MODEL_NAME,
         "epochs_ran": len(history["loss"]),
         "config": vars(args),
         "resolved_hparams": {
             "lr": lr,
-            "backbone_lr": backbone_lr,
             "optimizer": optimizer_name,
             "weight_decay": weight_decay,
             "batch_size": batch_size,
@@ -858,7 +823,6 @@ def main():
             "asl_gamma_pos": asl_gamma_pos,
             "asl_clip": asl_clip,
             "asl_weight": asl_weight,
-            "pretrained": pretrained,
             "ema": ema_enabled,
             "ema_decay": ema_decay,
         },
