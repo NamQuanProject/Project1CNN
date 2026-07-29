@@ -30,7 +30,7 @@ data/*.pt
 # OS
 .DS_Store
 Thumbs.db
-
+.claude/
 # Editor / IDE
 .vscode/
 .idea/
