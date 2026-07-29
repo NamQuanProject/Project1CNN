@@ -27,6 +27,7 @@ src/                      PyTorch pipeline (independent of cnn.ipynb)
   metrics.py              exact_match_accuracy, per_position_accuracy, binary_accuracy, precision_recall
   model.py                 ResNetCNN (nn.Module) and its building blocks
   train.py                 Headless training entrypoint (CLI)
+  continual_train.py         Uncertainty-guided continual-training phase on top of a checkpoint
   evaluate.py               Re-evaluate a saved checkpoint on the test set
   evaluate_augmentation.py    Test-time augmentation (TTA) evaluation, vs. plain baseline
   compare.py                 Diff two runs' test_metrics.json into a comparison table
@@ -194,6 +195,67 @@ Each run writes to `outputs/<run-name>/`:
 - `best_model.pt`, `final_model.pt` — saved checkpoints (`{"model_name", "state_dict", "ema_state_dict"}`)
 - `test_metrics.json` — test-set loss, binary_accuracy, precision, recall,
   exact_match_accuracy, and per-digit (per-position) accuracy
+
+### Continual training: uncertainty-guided batch selection
+
+```bash
+python src/continual_train.py --model-path outputs/resnet_v1/final_model.pt --epochs 20
+```
+
+A **separate, optional continuation phase** you run *after* a normal `train.py` run
+has already finished — it does not modify `train.py` or how the main training
+recipe works. Inspired by ["Batch Selection for Multi-Label Classification Guided
+by Uncertainty and Dynamic Label Correlations"](https://arxiv.org/abs/2412.16521)
+(arXiv 2412.16521): instead of uniform-random minibatches, it prioritizes training
+examples the model is currently *unstable* or *unconfident* about, so extra gradient
+updates concentrate on the genuinely hard cases rather than being spent equally on
+examples the model already has right.
+
+**How it works:**
+1. **Warm-up** (`--warmup-epochs`, default 5): trains normally (uniform shuffling)
+   while building a rolling window of every training example's per-label
+   predictions — there's no uncertainty signal to act on yet.
+2. **After warm-up**, each epoch: per-label uncertainty combines (a) how much the
+   prediction has *changed* over the last `--window` epochs (instability) and (b)
+   the *entropy* of the current prediction (how close to 0.5); a label-correlation
+   matrix (estimated via mutual information between labels' uncertainty patterns)
+   "smears" each label's uncertainty across labels it's jointly uncertain with;
+   per-instance scores become a **probability-weighted** sampling distribution (not
+   deterministic top-k — hard examples are *more likely* to be drawn, not
+   exclusively drawn) via `torch.utils.data.WeightedRandomSampler`.
+3. A **selection pressure** exponentially decays from strongly uncertainty-biased
+   right after warm-up to ~uniform by the final epoch, so "easy" examples are never
+   permanently excluded from training.
+4. **Learning rate handled carefully**: since this continues from an
+   already-converged checkpoint (not training from scratch), the peak LR defaults
+   to **1/10th** of the model's normal training LR (`--lr` to override), with a
+   short linear warmup (`--lr-warmup-epochs`, default 2) then cosine decay to a very
+   low floor (`--min-lr`) — deliberately avoiding a large-LR shock that could knock
+   the converged weights off their optimum.
+
+**Honesty note**: the paper's PDF didn't extract as readable text, so this is built
+from a secondary summary plus the extracted equations — the core structure (entropy
++ prediction-instability uncertainty, mutual-information label correlation,
+probability-weighted selection, decaying selection pressure) is faithful to that
+summary, but a couple of symbols in the sampling-probability formula weren't fully
+recoverable and were reconstructed to match the *described behavior* (see the
+`selection_probabilities` docstring in `src/continual_train.py` for exactly what was
+reconstructed and how it was verified). Every uncertainty/selection function has
+been unit-tested against hand-computable examples (entropy at p=0.5, mutual
+information of identical vs. independent columns, uniform-vs-biased sampling
+distributions, exact closed-form pressure decay) — see the module for details if
+you want to inspect or extend the math.
+
+Key flags (`python src/continual_train.py --help` for the full list): `--epochs`,
+`--warmup-epochs`, `--window` (T, instability window size), `--lam1` (entropy vs.
+instability trade-off), `--num-bins` (mutual-information discretization),
+`--selection-pressure-s0` (initial bias strength), `--lr`/`--lr-warmup-epochs`/
+`--min-lr`, `--monitor-metric`/`--patience` (same early-stopping convention as
+`train.py`), `--no-init-ema` (start from the checkpoint's raw weights instead of its
+EMA weights). Writes the same artifact set as `train.py` (`best_model.pt`,
+`final_model.pt`, `history.json`, `continual_training_curves.png`,
+`test_metrics.json`) to `outputs/<run-name>/`, `run-name` defaulting to
+`continual_<timestamp>`.
 
 ### Re-evaluating a saved checkpoint
 
