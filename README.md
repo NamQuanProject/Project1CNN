@@ -28,6 +28,7 @@ src/                      PyTorch pipeline (independent of cnn.ipynb)
   model.py                 ResNetCNN (nn.Module) and its building blocks
   train.py                 Headless training entrypoint (CLI)
   evaluate.py               Re-evaluate a saved checkpoint on the test set
+  evaluate_augmentation.py    Test-time augmentation (TTA) evaluation, vs. plain baseline
   compare.py                 Diff two runs' test_metrics.json into a comparison table
   visualize_errors.py        Save an annotated PNG for every exact-match mismatch
 outputs/                  Generated per-run artifacts (git-ignored)
@@ -203,6 +204,26 @@ python src/evaluate.py --model-path outputs/resnet_v1/final_model.pt
 Writes `test_metrics.json` and a `sample_predictions.png` grid to `outputs/eval/` by
 default. Uses the checkpoint's EMA weights automatically when present; pass
 `--no-ema` to evaluate the raw weights instead.
+
+### Test-time augmentation (TTA)
+
+```bash
+python src/evaluate_augmentation.py --model-path outputs/resnet_v1/final_model.pt
+```
+
+Averages predictions over 9 fixed, deterministic augmented views of each test
+image — identity + 4 pixel shifts (±2px) + 2 zoom levels (±8%) + 2 contrast levels
+(±12%) — mirroring the *same* augmentation space used at training time
+(`--augment` in `train.py`), deliberately **no rotation or flip** (would corrupt
+6/9 semantics). By default also runs a plain (single-forward-pass, no-TTA)
+baseline pass for direct comparison, printing the `exact_match_accuracy` delta.
+Free accuracy at inference time — no retraining, and since it never touches the
+trained weights, it can't make the model worse the way an architecture change can.
+
+Writes `tta_metrics.json` (both plain and TTA metrics, per-position accuracy, and
+the delta) to `outputs/eval_tta/` by default. Flags: `--no-shift`/`--no-zoom`/
+`--no-contrast` disable individual view types; `--no-compare` skips the plain
+baseline pass (TTA only); `--no-ema`, `--amp`, `--device` behave like `evaluate.py`.
 
 ### Visualizing exact-match errors
 
