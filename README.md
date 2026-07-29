@@ -69,29 +69,38 @@ implementation — a classmate's `assignment1_cnn.py` — that reached ~80% exac
 accuracy on this dataset; since widened/deepened):
 
 - **Stem**: a single 3×3 conv+BN+SiLU, no downsampling (stays at 64×64), outputting
-  64 channels.
-- **12 residual blocks in 3 stages of 4**, channels 64 → 128 → 256: stage 1 (64ch,
+  `stage_channels[0]` channels (64 by default).
+- **`blocks_per_stage` residual blocks per stage** (6 by default, i.e. 18 blocks
+  total), channels `stage_channels` (default 64 → 128 → 256): stage 1 (64ch,
   64×64) → stage 2 (128ch, 32×32) → stage 3 (256ch, 16×16). Only the first block of
-  each of stage 2/3 downsamples — same "don't over-downsample" philosophy as
-  before (a "downsample every block" design would end at a much smaller map,
-  hurting separation of several small, overlapping digits), just with more blocks
-  per stage and more channels per stage. The 3 same-resolution blocks per stage add
-  nonlinear depth before handing off to the next (downsampling + widening) stage.
+  each stage after the first downsamples — same "don't over-downsample" philosophy
+  as before (a "downsample every block" design would end at a much smaller map,
+  hurting separation of several small, overlapping digits). The same-resolution
+  blocks within a stage add nonlinear depth before handing off to the next
+  (downsampling + widening) stage. Both `ResNetCNN(...)` constructor args, so
+  rescaling the model (depth via `blocks_per_stage`, width via `stage_channels`) is
+  a one-line change rather than hand-editing a block list — prefer scaling
+  `blocks_per_stage` first, since adding a block grows params roughly linearly
+  while widening channels grows them roughly quadratically, and it preserves the
+  already-tuned 64×64→32×32→16×16 spatial schedule. At the default channels:
+  `blocks_per_stage=4` → ~5.9M params, `5` → ~7.4M, `6` (default) → ~9.0M,
+  `7` → ~10.5M.
 - Drop probability for stochastic depth increases with block depth (0 → 0.1 across
-  the 12 blocks, deeper blocks being more overfitting-prone) — regularization to
-  offset the substantially larger capacity of this configuration.
+  all blocks, deeper blocks being more overfitting-prone) — regularization to
+  offset the model's capacity.
 - **Head**: SpatialDropout (`nn.Dropout2d`, 0.15) → GlobalAveragePooling →
-  Dropout(0.35) → `Linear(256, 10)`. No `Flatten`/`Dense(256-unit-MLP)`: avoids a
-  large dense classifier, historically the main source of overfitting for this
-  dataset size (~50K training images).
+  Dropout(0.35) → `Linear(stage_channels[-1], 10)`. No `Flatten`/`Dense(256-unit-MLP)`:
+  avoids a large dense classifier, historically the main source of overfitting for
+  this dataset size (~50K training images).
 - Conv weights use explicit Kaiming-normal ("he_normal") init (`nonlinearity="relu"`
   for the gain calculation, the standard stand-in for SiLU/Swish since PyTorch has
   no dedicated entry — both behave near-linearly for positive inputs).
-- **~5.9M total parameters.** A ResNet-50 backbone was also tried on this task and
-  badly overfit at 23.5M parameters for a ~50K-image dataset — this configuration
-  sits at roughly a quarter of that, deliberately paired with MixUp (below) as
-  extra regularization to offset the larger capacity than the ~988K/0.88-exact-match
-  configuration this was widened from.
+- **~9.0M total parameters** (18 blocks, default `stage_channels`/`blocks_per_stage`).
+  A ResNet-50 backbone was also tried on this task and badly overfit at 23.5M
+  parameters for a ~50K-image dataset; this configuration sits at roughly a third
+  of that, deliberately paired with MixUp (below) as extra regularization to offset
+  the larger capacity than the ~988K/0.88-exact-match configuration this was
+  widened from.
 - Returns raw **logits**, not sigmoid probabilities — pair with one of the losses
   below, and apply `torch.sigmoid()` only at evaluation/inference time.
 

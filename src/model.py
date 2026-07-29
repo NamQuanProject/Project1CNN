@@ -117,24 +117,32 @@ class ResNetCNN(nn.Module):
     version, plus a channel-attention swap and a smoother activation):
 
     - Stem: a single 3x3 conv+BN+SiLU, no downsampling (stays at 64x64),
-      now outputting 64 channels (was 32).
-    - 12 residual blocks in 3 stages of 4, channels 64 -> 128 -> 256, only
-      the first block of stage 2 and stage 3 downsamples (64x64 -> 32x32 ->
-      16x16) -- same "don't over-downsample" philosophy as before (a
-      "downsample every block" design would end at a much smaller map,
-      hurting separation of several small, overlapping digits), just with
-      more blocks per stage and more channels per stage. The 3
-      same-resolution blocks per stage add nonlinear depth before handing
-      off to the next (downsampling + channel-widening) stage.
+      outputting `stage_channels[0]` channels (64 by default).
+    - `blocks_per_stage` residual blocks per stage (6 by default) across
+      `len(stage_channels)` stages (3 by default: 64 -> 128 -> 256) = 18
+      total blocks by default (~9M params). Only the first block of each
+      stage after the first downsamples (64x64 -> 32x32 -> 16x16) -- same
+      "don't over-downsample" philosophy as before (a "downsample every
+      block" design would end at a much smaller map, hurting separation of
+      several small, overlapping digits). The same-resolution blocks within
+      a stage add nonlinear depth before handing off to the next
+      (downsampling + channel-widening) stage. Scaling the model up or down
+      is a matter of changing `blocks_per_stage` (depth) and/or
+      `stage_channels` (width) -- prefer increasing `blocks_per_stage` for
+      scale-ups: it grows capacity roughly linearly per added block, unlike
+      widening channels (params grow roughly quadratically with channel
+      count), and preserves the already-tuned 64x64->32x32->16x16 spatial
+      schedule. E.g. blocks_per_stage=4 -> ~5.9M params, 5 -> ~7.4M,
+      6 -> ~9.0M, 7 -> ~10.5M (all at the default stage_channels).
     - Each residual block includes an ECA channel-attention gate (see
       `ECA`) and stochastic depth (see `DropPath`), with drop probability
-      increasing with block depth (0 -> `max_drop_path` across the 12
-      blocks) -- regularization to offset the substantially larger capacity
-      of this configuration vs. the earlier one.
+      increasing with block depth (0 -> `max_drop_path` across all blocks)
+      -- regularization to offset the model's capacity.
     - Head: SpatialDropout (nn.Dropout2d, 0.15) -> GlobalAveragePooling ->
-      Dropout(0.35) -> Linear(256, 10). No Flatten/Dense(256-unit-MLP):
-      avoids a large dense classifier, historically the main source of
-      overfitting for this dataset size (~50K training images).
+      Dropout(0.35) -> Linear(stage_channels[-1], 10). No
+      Flatten/Dense(256-unit-MLP): avoids a large dense classifier,
+      historically the main source of overfitting for this dataset size
+      (~50K training images).
     - Conv weights use explicit Kaiming-normal ("he_normal") init
       (`nonlinearity="relu"` is used for the gain calculation since PyTorch
       has no dedicated SiLU entry; relu's gain is the standard stand-in for
@@ -146,31 +154,35 @@ class ResNetCNN(nn.Module):
       can turn a 6 into a 9 or vice versa.
     """
 
-    def __init__(self, in_channels=1, num_classes=10, use_eca=True, max_drop_path=0.1):
+    def __init__(
+        self,
+        in_channels=1,
+        num_classes=10,
+        use_eca=True,
+        max_drop_path=0.1,
+        stage_channels=(64, 128, 256),
+        blocks_per_stage=6,
+    ):
         super().__init__()
+        stem_channels = stage_channels[0]
         self.stem = nn.Sequential(
-            nn.Conv2d(in_channels, 64, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(64),
+            nn.Conv2d(in_channels, stem_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(stem_channels),
             nn.SiLU(inplace=True),
         )
 
-        # (in_channels, out_channels, downsample) -- 3 stages of 4 blocks,
-        # channels 64 -> 128 -> 256, downsampling only at each stage's
-        # first block.
-        block_specs = [
-            (64, 64, False),
-            (64, 64, False),
-            (64, 64, False),
-            (64, 64, False),
-            (64, 128, True),
-            (128, 128, False),
-            (128, 128, False),
-            (128, 128, False),
-            (128, 256, True),
-            (256, 256, False),
-            (256, 256, False),
-            (256, 256, False),
-        ]
+        # (in_channels, out_channels, downsample). Every stage after the
+        # first downsamples on its first block only; every block after a
+        # stage's first stays at that stage's channel count and resolution.
+        block_specs = []
+        prev_channels = stem_channels
+        for stage_idx, channels in enumerate(stage_channels):
+            for block_idx in range(blocks_per_stage):
+                downsample = block_idx == 0 and stage_idx > 0
+                in_ch = prev_channels if block_idx == 0 else channels
+                block_specs.append((in_ch, channels, downsample))
+            prev_channels = channels
+
         n = len(block_specs)
         drop_probs = [max_drop_path * i / (n - 1) for i in range(n)]
         self.blocks = nn.ModuleList(
@@ -183,7 +195,7 @@ class ResNetCNN(nn.Module):
         self.spatial_dropout = nn.Dropout2d(0.15)
         self.pool = nn.AdaptiveAvgPool2d(1)
         self.dropout = nn.Dropout(0.35)
-        self.fc = nn.Linear(256, num_classes)
+        self.fc = nn.Linear(stage_channels[-1], num_classes)
 
         self.apply(self._init_weights)
 
@@ -261,7 +273,7 @@ MODEL_HPARAM_DEFAULTS = {
         # early-stopping patience is generous (vs. the smaller model's 10)
         # so it doesn't cut the anneal short; this is also now a bigger
         # model (12 blocks, 64->128->256ch) that may need more epochs.
-        "patience": 30,
+        "patience": 20,
         # Early-stopping / checkpoint-selection watches exact-match accuracy
         # directly (mode "max") instead of val_loss -- that's the metric that
         # actually matters for this task, and can improve even while val_loss
@@ -275,7 +287,7 @@ MODEL_HPARAM_DEFAULTS = {
         # linearly interpolates their multi-hot labels by the same factor.
         # 0.2 is the standard value from the paper; regularizes the larger
         # capacity of this configuration.
-        "mixup_alpha": 0.2,
+        "mixup_alpha": 0.3,
         # Asymmetric Loss (Ben-Baruch/Ridnik et al., ICCV 2021) instead of
         # plain BCE: handles the positive/negative imbalance in this task
         # (~6-8 of 10 digit slots present per image, so negatives outnumber
